@@ -20,8 +20,15 @@ export BT_NO_PARSE_CLI_ARGS=false
 #   First setup:    ./run_miner.sh -G -w mywallet -h myhotkey
 #   Update/restart: ./run_miner.sh
 #   Override steps: ./run_miner.sh -t "gtx_train_steps=100 gtx_train_batch_size=8"
+#
+# Frozen deployment bundle (agents + miner.env + run.sh in one directory):
+#   ./scripts/bundle_agent_release.sh TurboForgeV2Agent forge-v2-1.0.0 --netuid 79
+#   ./deployments/forge-v2-1.0.0/run.sh
+#   # or: ./run_miner.sh -d deployments/forge-v2-1.0.0
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_DIR=""
+_DEPLOY_MODE=0
 
 ENDPOINT=wss://entrypoint-finney.opentensor.ai:443
 WALLET_PATH=~/.bittensor/wallets/
@@ -33,6 +40,7 @@ AGENT_PATH=~/.taos/agents
 AGENT_NAME=SimpleRegressorAgent
 AGENT_PARAMS="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
 LOG_LEVEL=info
+PM2_NAME=miner
 GENTRX=0          # 1 = enable GenTRX training mode
 GENTRX_PARAMS=""  # override GenTRX-specific params (gtx_* keys)
 
@@ -41,12 +49,7 @@ _EXPLICIT_AGENT=0
 _EXPLICIT_PARAMS=0
 _EXPLICIT_GENTRX_PARAMS=0
 
-# set -a auto-exports every var the sourced file sets, so pm2 (and any other
-# child process) inherits them. Plain `. .env` would only populate this
-# script's shell vars.
-[ -f "$REPO_ROOT/.env" ] && { set -a; . "$REPO_ROOT/.env"; set +a; }
-
-while getopts e:p:w:h:u:a:g:n:m:t:l:G flag; do
+while getopts e:p:w:h:u:a:g:n:m:t:l:Gd: flag; do
     case "${flag}" in
         e) ENDPOINT=${OPTARG};;
         p) WALLET_PATH=${OPTARG};;
@@ -60,8 +63,36 @@ while getopts e:p:w:h:u:a:g:n:m:t:l:G flag; do
         t) GENTRX_PARAMS=${OPTARG};    _EXPLICIT_GENTRX_PARAMS=1;;
         l) LOG_LEVEL=${OPTARG};;
         G) GENTRX=1;;
+        d) DEPLOY_DIR=${OPTARG};;
     esac
 done
+
+if [ -n "$DEPLOY_DIR" ]; then
+    DEPLOY_DIR="$(cd "$DEPLOY_DIR" && pwd)"
+    if [ ! -f "$DEPLOY_DIR/miner.env" ]; then
+        echo "ERROR: missing $DEPLOY_DIR/miner.env" >&2
+        exit 1
+    fi
+    set -a
+    # shellcheck disable=SC1091
+    . "$DEPLOY_DIR/miner.env"
+    set +a
+    AGENT_PATH="$DEPLOY_DIR/agents"
+    if [ -f "$DEPLOY_DIR/.env" ]; then
+        set -a
+        # shellcheck disable=SC1091
+        . "$DEPLOY_DIR/.env"
+        set +a
+    fi
+    _DEPLOY_MODE=1
+else
+    # set -a auto-exports every var the sourced file sets, so pm2 (and any other
+    # child process) inherits them. Plain `. .env` would only populate this
+    # script's shell vars.
+    [ -f "$REPO_ROOT/.env" ] && { set -a; . "$REPO_ROOT/.env"; set +a; }
+fi
+
+PM2_NAME="${PM2_NAME:-miner}"
 
 # If -G not passed but GenTRX was previously enabled, restore saved mode
 if [ "$GENTRX" = "0" ] && [ "${GENTRX_ENABLED:-0}" = "1" ]; then
@@ -99,12 +130,26 @@ fi
 echo "ENDPOINT:        $ENDPOINT"
 echo "WALLET:          $WALLET_PATH $WALLET_NAME / $HOTKEY_NAME"
 echo "NETUID:          $NETUID"
+echo "PM2_NAME:        $PM2_NAME"
 echo "AXON_PORT:       $AXON_PORT"
 echo "AGENT_PATH:      $AGENT_PATH"
 echo "AGENT_NAME:      $AGENT_NAME"
 echo "AGENT_PARAMS:    $AGENT_PARAMS"
 echo "GENTRX:          $GENTRX"
 echo "GENTRX_PARAMS:   ${GENTRX_PARAMS:-(defaults)}"
+if [ "$_DEPLOY_MODE" = "1" ]; then
+    echo "DEPLOY_DIR:      $DEPLOY_DIR"
+    if [ -f "$DEPLOY_DIR/RELEASE.txt" ]; then
+        echo "RELEASE:         $(head -1 "$DEPLOY_DIR/RELEASE.txt")"
+    fi
+fi
+
+if [ "$_DEPLOY_MODE" = "1" ]; then
+    if [ -z "$PM2_NAME" ] || [ -z "$WALLET_NAME" ] || [ -z "$HOTKEY_NAME" ] || [ -z "$AXON_PORT" ]; then
+        echo "ERROR: Fill PM2_NAME, WALLET_NAME, HOTKEY_NAME, and AXON_PORT in $DEPLOY_DIR/miner.env" >&2
+        exit 1
+    fi
+fi
 
 cd "$REPO_ROOT"
 git pull || { echo "WARNING: git pull failed (no tracking branch?). Continue without updating? [y/N]"; read -r _yn; [ "$_yn" = "y" ] || exit 1; }
@@ -387,9 +432,9 @@ read -ra _agent_params <<< "$AGENT_PARAMS"
 read -ra _gentrx_params <<< "$GENTRX_PARAMS"
 
 if [ "$GENTRX" = "1" ]; then
-    pm2 delete miner 2>/dev/null || true
+    pm2 delete "$PM2_NAME" 2>/dev/null || true
     pm2 start miner.py \
-        --name=miner \
+        --name="$PM2_NAME" \
         --interpreter python \
         --cwd "$REPO_ROOT/taos/im/neurons" \
         -- \
@@ -428,9 +473,9 @@ print(m.group(1) if m else '')
     tmux select-pane -t miner:miner.0
     tmux attach-session -t miner
 else
-    pm2 delete miner 2>/dev/null || true
+    pm2 delete "$PM2_NAME" 2>/dev/null || true
     pm2 start miner.py \
-        --name=miner \
+        --name="$PM2_NAME" \
         --interpreter python \
         --cwd "$REPO_ROOT/taos/im/neurons" \
         -- \
@@ -446,5 +491,5 @@ else
         --agent.params "${_agent_params[@]}"
     pm2 save || true
     pm2 startup || true
-    pm2 logs miner
+    pm2 logs "$PM2_NAME"
 fi

@@ -422,6 +422,16 @@ The example agents in `agents/` (RandomMaker, SimpleRegressor, etc.) are for lea
 | `run_miner_power2.sh` | **TurboEdgeAgent** | `edge` | Cross-book median + reversion |
 | `run_miner_power3.sh` | **TurboForgeAgent** | `forge` | Balanced default (start here) |
 
+### Turbo v2 deployment bundles (new miners only)
+
+Frozen **agents + miner.env + run.sh** per release. Use **new** runners — do not change `run_miner_power1`–`3` (existing test miners).
+
+| Script | Deployment | Agent | Best for |
+|--------|------------|-------|----------|
+| `run_deploy_pulse_v2.sh` | `deployments/pulse-v2-1.0.0/` | **TurboPulseV2Agent** | Round-trip throughput |
+| `run_deploy_apex_v2.sh` | `deployments/apex-v2-1.0.0/` | **TurboApexV2Agent** | Quality-first optimum |
+| `run_deploy_forge_v2.sh` | `deployments/forge-v2-1.0.0/` | **TurboForgeV2Agent** | Balanced v2 default |
+
 ### Turbo v2 (higher round-trip quality)
 
 When you have instruction headroom (≤4/book, ≤28–30/tick) and want **better fill rate** and **completed round trips**, use v2. Same scoring targets; execution is smarter:
@@ -445,21 +455,15 @@ Engine: `agents/competitive_utils.py` → `turbo_v2_kappa_score_tick`. Key param
 
 ### Setup
 
-1. Edit the run script — fill in:
+1. **Existing test miners** — edit `run_miner_power1.sh` … `power3.sh` as before.
+
+2. **New v2 miners** — edit `deployments/<release>/miner.env`, then:
 
    ```bash
-   PM2_NAME=miner240
-   EXPECTED_UID=240
-   WALLET_NAME=your-coldkey
-   HOTKEY_NAME=your-hotkey
-   AXON_PORT=8110
+   ./run_deploy_forge_v2.sh   # or pulse / apex
    ```
 
-2. Launch:
-
-   ```bash
-   ./run_miner_power3.sh
-   ```
+   Bundle another release: `./scripts/bundle_agent_release.sh TurboForgeV2Agent forge-v2-1.1.0 --endpoint test`
 
 3. Monitor [testnet.simulate.trading](https://testnet.simulate.trading) — scores lag 45–90+ min after relaunch.
 
@@ -475,6 +479,18 @@ Engine: `agents/competitive_utils.py` → `turbo_v2_kappa_score_tick`. Key param
 | Incentive | Follows trading score EMA on-chain |
 
 Engine v1: `turbo_kappa_score_tick` · v2: `turbo_v2_kappa_score_tick`. Always use `lazy_load=1`.
+
+### Deployment bundles (mainnet: agents + runner together)
+
+Avoid maintaining separate `run_miner_powerN.sh` files per UID. Bundle **frozen agents**, **miner.env**, and **run.sh** into one directory:
+
+```bash
+./scripts/bundle_agent_release.sh TurboForgeV2Agent forge-v2-1.0.0 --netuid 79
+# edit deployments/forge-v2-1.0.0/miner.env (wallet, PM2_NAME, AXON_PORT)
+./deployments/forge-v2-1.0.0/run.sh
+```
+
+Each mainnet UID gets its own `deployments/<release-id>/` folder. Upgrade one UID by bundling a new release-id; older folders stay untouched. Testnet: add `--endpoint test`.
 
 ---
 

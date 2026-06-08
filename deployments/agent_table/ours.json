@@ -1,0 +1,41 @@
+{
+  "description": "Our miners — agent_id is the UID from the Agents table (metric.agent_id).",
+  "miners": [
+    {
+      "agent_id": "243",
+      "label": "test-pulse-v1",
+      "deployment": null,
+      "run_script": "run_miner_power1.sh"
+    },
+    {
+      "agent_id": "244",
+      "label": "test-edge-v1",
+      "deployment": null,
+      "run_script": "run_miner_power2.sh"
+    },
+    {
+      "agent_id": "245",
+      "label": "test-forge-v1",
+      "deployment": null,
+      "run_script": "run_miner_power3.sh"
+    },
+    {
+      "agent_id": "65",
+      "label": "deploy-pulse-v2",
+      "deployment": "pulse-v2-1.0.0",
+      "run_script": "run_deploy_pulse_v2.sh"
+    },
+    {
+      "agent_id": "10",
+      "label": "deploy-apex-v2",
+      "deployment": "apex-v2-1.0.0",
+      "run_script": "run_deploy_apex_v2.sh"
+    },
+    {
+      "agent_id": "158",
+      "label": "deploy-forge-v2",
+      "deployment": "forge-v2-1.0.0",
+      "run_script": "run_deploy_forge_v2.sh"
+    }
+  ]
+}
