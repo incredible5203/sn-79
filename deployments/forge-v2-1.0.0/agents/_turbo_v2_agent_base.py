@@ -13,7 +13,14 @@ if _agent_dir not in sys.path:
 
 import bittensor as bt
 
-from competitive_utils import param_bool, turbo_survive_score_tick, turbo_v2_kappa_score_tick
+from competitive_utils import (
+    _InstructionBudget,
+    param_bool,
+    startup_cancel_all_orders,
+    turbo_recover_score_tick,
+    turbo_survive_score_tick,
+    turbo_v2_kappa_score_tick,
+)
 from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
 from taos.im.protocol.events import TradeEvent
@@ -114,6 +121,26 @@ _PROFILE_DEFAULTS_V2: dict[str, dict] = {
         "min_fill_score": 0.0,
         "min_spread_ticks_rt": 5.0,
         "min_rt_edge_ticks": 3.0,
+        "max_edge_per_tick": 0,
+    },
+    "recover": {
+        "max_quantity": 0.30,
+        "quantity_scale": 0.90,
+        "max_books_per_tick": 7,
+        "max_two_sided_per_tick": 0,
+        "max_total_instructions": 16,
+        "max_instructions_per_book": 3,
+        "book_rotation_groups": 16,
+        "cadence_interval_ns": 24_000_000_000,
+        "max_spread_ratio": 0.0012,
+        "inactive_book_frac": 0.30,
+        "inventory_skew_soft": 0.012,
+        "inventory_skew_hard": 0.028,
+        "max_requote_per_tick": 0,
+        "touch_join_on_requote": 0,
+        "min_fill_score": 0.0,
+        "min_spread_ticks_rt": 4.0,
+        "min_rt_edge_ticks": 4.0,
         "max_edge_per_tick": 0,
     },
 }
@@ -277,11 +304,19 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
         )
         self._debug_state_tick = 0
 
+        default_cancel_all = self.turbo_profile in ("recover", "survive")
+        self.cancel_all_on_startup = param_bool(
+            getattr(self.config, "cancel_all_on_startup", default_cancel_all),
+            default_cancel_all,
+        )
+        self._startup_cancel_active = self.cancel_all_on_startup
+
         bt.logging.info(
             f"{self.agent_label} | profile={self.turbo_profile} "
             f"qty[{self.min_quantity},{self.max_quantity}] "
             f"books/tick={self.max_books_per_tick} "
-            f"instr_cap={self.max_total_instructions}"
+            f"instr_cap={self.max_total_instructions} "
+            f"cancel_all_on_startup={self.cancel_all_on_startup}"
         )
 
     def _completion_side(self, event: TradeEvent) -> OrderDirection:
@@ -289,7 +324,7 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
         return OrderDirection.BUY if event.side == 0 else OrderDirection.SELL
 
     def onTrade(self, event: TradeEvent, validator: str = None) -> None:
-        if self.turbo_profile == "survive":
+        if self.turbo_profile in ("survive", "recover"):
             return
         if event.makerAgentId != self.uid or event.bookId is None:
             return
@@ -321,8 +356,61 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
             )
         super().update(state)
 
+    def _run_startup_cancel_all(
+        self, response: FinanceAgentResponse
+    ) -> bool:
+        """Cancel legacy resting orders. Returns True to skip trading this tick."""
+        if not self._startup_cancel_active:
+            return False
+        cancel_budget = _InstructionBudget(5, 28)
+        had_orders = any(acct.orders for acct in self.accounts.values())
+        if not had_orders:
+            self._startup_cancel_active = False
+            bt.logging.info(f"{self.agent_label} | startup cancel-all complete (no orders)")
+            return False
+        complete = startup_cancel_all_orders(
+            response, self.accounts, cancel_budget
+        )
+        if complete:
+            self._startup_cancel_active = False
+            bt.logging.info(f"{self.agent_label} | startup cancel-all complete")
+            return bool(response.instructions)
+        bt.logging.info(
+            f"{self.agent_label} | startup cancel-all in progress "
+            f"({len(response.instructions)} cancels this tick)"
+        )
+        return True
+
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
         response = FinanceAgentResponse(agent_id=self.uid)
+        if self._run_startup_cancel_all(response):
+            return response
+        if self.turbo_profile == "recover":
+            turbo_recover_score_tick(
+                response,
+                state,
+                self.accounts,
+                self.simulation_config,
+                self.direction,
+                last_mid=self._last_mid,
+                mids_scratch=self._mids_scratch,
+                min_quantity=self.min_quantity,
+                max_quantity=self.max_quantity,
+                max_fee_rate=self.max_fee_rate,
+                quantity_scale=self.quantity_scale,
+                expiry_period=self.expiry_period,
+                inventory_skew_soft=self.inventory_skew_soft,
+                inventory_skew_hard=self.inventory_skew_hard,
+                max_books_per_tick=self.max_books_per_tick,
+                max_instructions_per_book=self.max_instructions_per_book,
+                max_total_instructions=self.max_total_instructions,
+                book_rotation_groups=self.book_rotation_groups,
+                cadence_interval_ns=self.cadence_interval_ns,
+                max_spread_ratio=self.max_spread_ratio,
+                min_spread_ticks=self.min_spread_ticks,
+                min_rt_edge_ticks=self.min_rt_edge_ticks,
+            )
+            return response
         if self.turbo_profile == "survive":
             turbo_survive_score_tick(
                 response,
