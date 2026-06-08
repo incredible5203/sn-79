@@ -13,7 +13,7 @@ if _agent_dir not in sys.path:
 
 import bittensor as bt
 
-from competitive_utils import param_bool, turbo_v2_kappa_score_tick
+from competitive_utils import param_bool, turbo_survive_score_tick, turbo_v2_kappa_score_tick
 from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
 from taos.im.protocol.events import TradeEvent
@@ -97,6 +97,25 @@ _PROFILE_DEFAULTS_V2: dict[str, dict] = {
         "touch_join_on_requote": 1,
         "min_fill_score": 6.0,
     },
+    "survive": {
+        "max_quantity": 0.30,
+        "quantity_scale": 0.88,
+        "max_books_per_tick": 3,
+        "max_two_sided_per_tick": 0,
+        "max_total_instructions": 5,
+        "max_instructions_per_book": 2,
+        "book_rotation_groups": 20,
+        "cadence_interval_ns": 30_000_000_000,
+        "max_spread_ratio": 0.0010,
+        "inventory_skew_soft": 0.005,
+        "inventory_skew_hard": 0.012,
+        "max_requote_per_tick": 0,
+        "touch_join_on_requote": 0,
+        "min_fill_score": 0.0,
+        "min_spread_ticks_rt": 5.0,
+        "min_rt_edge_ticks": 3.0,
+        "max_edge_per_tick": 0,
+    },
 }
 
 
@@ -120,10 +139,10 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
 
         self.min_quantity = float(getattr(self.config, "min_quantity", 0.28))
         self.max_quantity = float(
-            getattr(self.config, "max_quantity", defaults["max_quantity"])
+            getattr(self.config, "max_quantity", defaults.get("max_quantity", 0.44))
         )
         self.quantity_scale = float(
-            getattr(self.config, "quantity_scale", defaults["quantity_scale"])
+            getattr(self.config, "quantity_scale", defaults.get("quantity_scale", 0.95))
         )
         self.max_fee_rate = float(getattr(self.config, "max_fee_rate", 0.002))
         self.relative_threshold = float(
@@ -141,43 +160,74 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
             )
         )
         self.cadence_interval_ns = int(
-            getattr(self.config, "cadence_interval_ns", defaults["cadence_interval_ns"])
+            getattr(
+                self.config,
+                "cadence_interval_ns",
+                defaults.get("cadence_interval_ns", 21_000_000_000),
+            )
         )
         self.inventory_skew_soft = float(
-            getattr(self.config, "inventory_skew_soft", 0.024)
+            getattr(
+                self.config,
+                "inventory_skew_soft",
+                defaults.get("inventory_skew_soft", 0.024),
+            )
         )
         self.inventory_skew_hard = float(
-            getattr(self.config, "inventory_skew_hard", 0.044)
+            getattr(
+                self.config,
+                "inventory_skew_hard",
+                defaults.get("inventory_skew_hard", 0.044),
+            )
+        )
+        self.min_spread_ticks = float(
+            getattr(
+                self.config,
+                "min_spread_ticks",
+                defaults.get("min_spread_ticks_rt", 5.0),
+            )
         )
         self.max_books_per_tick = int(
-            getattr(self.config, "max_books_per_tick", defaults["max_books_per_tick"])
+            getattr(
+                self.config, "max_books_per_tick", defaults.get("max_books_per_tick", 11)
+            )
         )
         self.book_rotation_groups = int(
             getattr(
-                self.config, "book_rotation_groups", defaults["book_rotation_groups"]
+                self.config,
+                "book_rotation_groups",
+                defaults.get("book_rotation_groups", 16),
             )
         )
         self.max_spread_ratio = float(
-            getattr(self.config, "max_spread_ratio", defaults["max_spread_ratio"])
+            getattr(
+                self.config, "max_spread_ratio", defaults.get("max_spread_ratio", 0.0015)
+            )
         )
         self.inactive_book_frac = float(
-            getattr(self.config, "inactive_book_frac", defaults["inactive_book_frac"])
+            getattr(
+                self.config, "inactive_book_frac", defaults.get("inactive_book_frac", 0.30)
+            )
         )
         self.max_two_sided_per_tick = int(
             getattr(
                 self.config,
                 "max_two_sided_per_tick",
-                defaults["max_two_sided_per_tick"],
+                defaults.get("max_two_sided_per_tick", 4),
             )
         )
         self.max_instructions_per_book = int(
-            getattr(self.config, "max_instructions_per_book", 4)
+            getattr(
+                self.config,
+                "max_instructions_per_book",
+                defaults.get("max_instructions_per_book", 4),
+            )
         )
         self.max_total_instructions = int(
             getattr(
                 self.config,
                 "max_total_instructions",
-                defaults["max_total_instructions"],
+                defaults.get("max_total_instructions", 28),
             )
         )
         self.expiry_period = int(
@@ -228,12 +278,10 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
         self._debug_state_tick = 0
 
         bt.logging.info(
-            f"{self.agent_label} | profile={self.turbo_profile} v2 "
+            f"{self.agent_label} | profile={self.turbo_profile} "
             f"qty[{self.min_quantity},{self.max_quantity}] "
             f"books/tick={self.max_books_per_tick} "
-            f"instr_cap={self.max_total_instructions} "
-            f"requote={self.max_requote_per_tick} "
-            f"min_fill={self.min_fill_score}"
+            f"instr_cap={self.max_total_instructions}"
         )
 
     def _completion_side(self, event: TradeEvent) -> OrderDirection:
@@ -241,6 +289,8 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
         return OrderDirection.BUY if event.side == 0 else OrderDirection.SELL
 
     def onTrade(self, event: TradeEvent, validator: str = None) -> None:
+        if self.turbo_profile == "survive":
+            return
         if event.makerAgentId != self.uid or event.bookId is None:
             return
         self._requote[event.bookId] = (self._completion_side(event), 0)
@@ -272,8 +322,34 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
         super().update(state)
 
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
-        self._decay_requote()
         response = FinanceAgentResponse(agent_id=self.uid)
+        if self.turbo_profile == "survive":
+            turbo_survive_score_tick(
+                response,
+                state,
+                self.accounts,
+                self.simulation_config,
+                self.direction,
+                last_mid=self._last_mid,
+                mids_scratch=self._mids_scratch,
+                min_quantity=self.min_quantity,
+                max_quantity=self.max_quantity,
+                max_fee_rate=self.max_fee_rate,
+                quantity_scale=self.quantity_scale,
+                expiry_period=self.expiry_period,
+                inventory_skew_soft=self.inventory_skew_soft,
+                inventory_skew_hard=self.inventory_skew_hard,
+                max_books_per_tick=self.max_books_per_tick,
+                max_instructions_per_book=self.max_instructions_per_book,
+                max_total_instructions=self.max_total_instructions,
+                book_rotation_groups=self.book_rotation_groups,
+                cadence_interval_ns=self.cadence_interval_ns,
+                max_spread_ratio=self.max_spread_ratio,
+                min_spread_ticks=self.min_spread_ticks,
+                min_rt_edge_ticks=self.min_rt_edge_ticks,
+            )
+            return response
+        self._decay_requote()
         turbo_v2_kappa_score_tick(
             response,
             state,

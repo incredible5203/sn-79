@@ -977,3 +977,190 @@ def turbo_v2_kappa_score_tick(
         ):
             placed_books.add(book_id)
             edge_count += 1
+
+
+# ---------------------------------------------------------------------------
+# survive — stop realized-PnL bleed: cancel, flatten, minimal wide-spread maker
+# ---------------------------------------------------------------------------
+
+
+def turbo_survive_score_tick(
+    response,
+    state,
+    accounts,
+    simulation_config,
+    direction: dict[int, OrderDirection],
+    *,
+    last_mid: dict[int, float],
+    mids_scratch: dict[int, float],
+    min_quantity: float,
+    max_quantity: float,
+    max_fee_rate: float,
+    quantity_scale: float,
+    expiry_period: int,
+    inventory_skew_soft: float = 0.005,
+    inventory_skew_hard: float = 0.012,
+    max_books_per_tick: int = 3,
+    max_instructions_per_book: int = 2,
+    max_total_instructions: int = 5,
+    book_rotation_groups: int = 20,
+    cadence_interval_ns: int = 30_000_000_000,
+    max_spread_ratio: float = 0.0010,
+    min_spread_ticks: float = 5.0,
+    min_rt_edge_ticks: float = 3.0,
+) -> None:
+    """
+    Emergency capital-preservation mode.
+
+    Stops the failure mode seen on UIDs 10/65/158: high round-trip volume with
+    deeply negative realized PnL and kappa still None.
+
+    Rules:
+      - NO requote, NO two-sided, NO edge/reversion
+      - Cancel stale resting orders first
+      - Flatten any book with inventory skew (inside; cross only if hard breach)
+      - At most max_books_per_tick new single-sided INSIDE quotes
+      - Only books with wide spread (>= min_spread_ticks) and capturable edge
+    """
+    vdec = simulation_config.volumeDecimals
+    pdec = simulation_config.priceDecimals
+    ts = state.timestamp
+    tick = tick_size(pdec)
+    rot = (ts // cadence_interval_ns) % max(book_rotation_groups, 1)
+    budget = _InstructionBudget(max_instructions_per_book, max_total_instructions)
+
+    repay_loans_fifo(
+        response,
+        accounts,
+        simulation_config,
+        min_quantity=min_quantity,
+        rotate_key=ts // max(cadence_interval_ns, 1),
+    )
+
+    mids_scratch.clear()
+    book_rows: dict[int, tuple[Book, float, float, float]] = {}
+    for book_id, book in state.books.items():
+        t = _touch(book)
+        if t is None:
+            continue
+        best_bid, best_ask, mid = t
+        spread_r = (best_ask - best_bid) / mid if mid > 0 else 1.0
+        if spread_r > max_spread_ratio:
+            continue
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < min_spread_ticks:
+            continue
+        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
+            continue
+        if abs(tape_imbalance_ratio(book)) > 0.40:
+            continue
+        if not maker_fee_ok(accounts, book_id, max_fee_rate):
+            continue
+        mids_scratch[book_id] = mid
+        book_rows[book_id] = (book, best_bid, best_ask, mid)
+        last_mid[book_id] = mid
+
+    if not book_rows:
+        return
+
+    qty = round(max(min_quantity, max_quantity * quantity_scale), vdec)
+    qty = max(qty, min_quantity)
+    placed: set[int] = set()
+
+    # Phase 1 — cancel stale on any book with open orders (free slots for flatten)
+    for book_id, (_book, best_bid, best_ask, _mid) in sorted(book_rows.items()):
+        if budget.total >= max_total_instructions:
+            break
+        cancel_stale_orders(
+            response,
+            accounts[book_id],
+            book_id,
+            best_bid,
+            best_ask,
+            tick,
+            budget,
+            max_cancel=max_instructions_per_book,
+        )
+
+    # Phase 2 — flatten skewed inventory (priority)
+    flatten_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
+    for book_id, (_book, best_bid, best_ask, mid) in book_rows.items():
+        if _has_loan(accounts, book_id):
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        if abs(skew) < inventory_skew_soft:
+            continue
+        trade_dir = OrderDirection.SELL if skew > 0 else OrderDirection.BUY
+        flatten_jobs.append((abs(skew) * 100.0, book_id, best_bid, best_ask, mid, trade_dir))
+    flatten_jobs.sort(key=lambda x: -x[0])
+
+    for _prio, book_id, best_bid, best_ask, mid, trade_dir in flatten_jobs:
+        if budget.total >= max_total_instructions or len(placed) >= max_books_per_tick:
+            break
+        if book_id in placed:
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        mode = "cross" if abs(skew) >= inventory_skew_hard else "inside"
+        price = _limit_price(trade_dir, best_bid, best_ask, tick, pdec, mode=mode)
+        account = accounts[book_id]
+        if trade_dir == OrderDirection.BUY:
+            if price >= best_ask or account.quote_balance.free < qty * price:
+                continue
+        elif price <= best_bid or account.base_balance.free < qty:
+            continue
+        if not budget.can_place(book_id, 1):
+            continue
+        place_limit(response, book_id, trade_dir, qty, price, expiry_period)
+        budget.mark(book_id, 1)
+        placed.add(book_id)
+        direction[book_id] = (
+            OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
+        )
+
+    # Phase 3 — passive inside quotes on widest spreads only (single-sided)
+    quote_candidates: list[tuple[float, int, float, float, float]] = []
+    for book_id, (_book, best_bid, best_ask, mid) in book_rows.items():
+        if book_id in placed or _has_loan(accounts, book_id):
+            continue
+        if (book_id % book_rotation_groups) != rot:
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        if abs(skew) >= inventory_skew_soft:
+            continue
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        quote_candidates.append((spread_ticks, book_id, best_bid, best_ask, mid))
+    quote_candidates.sort(key=lambda x: -x[0])
+
+    quote_count = 0
+    for spread_ticks, book_id, best_bid, best_ask, mid in quote_candidates:
+        if quote_count >= max_books_per_tick or budget.total >= max_total_instructions:
+            break
+        if book_id in placed:
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        if skew > 0.002:
+            trade_dir = OrderDirection.SELL
+        elif skew < -0.002:
+            trade_dir = OrderDirection.BUY
+        else:
+            trade_dir = (
+                OrderDirection.BUY if (book_id + rot) % 2 == 0 else OrderDirection.SELL
+            )
+        price = _limit_price(
+            trade_dir, best_bid, best_ask, tick, pdec, mode="inside"
+        )
+        account = accounts[book_id]
+        if trade_dir == OrderDirection.BUY:
+            if price >= best_ask or account.quote_balance.free < qty * price:
+                continue
+        elif price <= best_bid or account.base_balance.free < qty:
+            continue
+        if not budget.can_place(book_id, 1):
+            continue
+        place_limit(response, book_id, trade_dir, qty, price, expiry_period)
+        budget.mark(book_id, 1)
+        placed.add(book_id)
+        quote_count += 1
+        direction[book_id] = (
+            OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
+        )
