@@ -580,6 +580,39 @@ def _rt_edge_ticks(
     return (sell_p - buy_p) / tick
 
 
+def _completion_rt_edge_ticks(
+    fill_price: float,
+    comp_dir: OrderDirection,
+    best_bid: float,
+    best_ask: float,
+    tick: float,
+    pdec: int,
+) -> float:
+    """Expected round-trip edge in ticks after a maker fill and inside completion."""
+    if tick <= 0:
+        return 0.0
+    comp_price = _limit_price(
+        comp_dir, best_bid, best_ask, tick, pdec, mode="inside"
+    )
+    if comp_dir == OrderDirection.SELL:
+        edge = comp_price - fill_price
+    else:
+        edge = fill_price - comp_price
+    return edge / tick
+
+
+def _iter_requote_hints(
+    requote_hints: dict[int, OrderDirection | tuple[OrderDirection, float]],
+) -> list[tuple[int, OrderDirection, float | None]]:
+    rows: list[tuple[int, OrderDirection, float | None]] = []
+    for book_id, hint in requote_hints.items():
+        if isinstance(hint, tuple):
+            rows.append((book_id, hint[0], float(hint[1])))
+        else:
+            rows.append((book_id, hint, None))
+    return rows
+
+
 def startup_cancel_all_orders(
     response,
     accounts,
@@ -806,7 +839,7 @@ def turbo_v2_kappa_score_tick(
 
     # Phase 0 — complete round trips after recent maker fills
     requote_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
-    for book_id, comp_dir in requote_hints.items():
+    for book_id, comp_dir, _fill_price in _iter_requote_hints(requote_hints):
         row = book_rows.get(book_id)
         if row is None or _has_loan(accounts, book_id):
             continue
@@ -1189,6 +1222,248 @@ def turbo_survive_score_tick(
         )
 
 
+def turbo_power_score_tick(
+    response,
+    state,
+    accounts,
+    simulation_config,
+    direction: dict[int, OrderDirection],
+    *,
+    last_mid: dict[int, float],
+    mids_scratch: dict[int, float],
+    requote_hints: dict[int, OrderDirection] | None = None,
+    min_quantity: float,
+    max_quantity: float,
+    max_fee_rate: float,
+    quantity_scale: float,
+    expiry_period: int,
+    inventory_skew_soft: float = 0.015,
+    inventory_skew_hard: float = 0.030,
+    max_books_per_tick: int = 10,
+    max_instructions_per_book: int = 4,
+    max_total_instructions: int = 26,
+    max_requote_per_tick: int = 6,
+    book_rotation_groups: int = 12,
+    cadence_interval_ns: int = 20_000_000_000,
+    max_spread_ratio: float = 0.0014,
+    min_spread_ticks: float = 4.0,
+    min_rt_edge_ticks: float = 4.0,
+    min_fill_score: float = 2.5,
+) -> None:
+    """
+    Scoring-focused mode: recover discipline + v2 completion legs (inside only).
+
+    More books/instructions than recover for Kappa observations; avoids v2 bugs
+    (no two-sided, no edge, no touch-join). Completion legs require positive
+    expected round-trip edge vs the maker fill price.
+    """
+    requote_hints = requote_hints or {}
+    vdec = simulation_config.volumeDecimals
+    pdec = simulation_config.priceDecimals
+    ts = state.timestamp
+    tick = tick_size(pdec)
+    rot = (ts // cadence_interval_ns) % max(book_rotation_groups, 1)
+    active_rots = {
+        rot,
+        (rot + 1) % book_rotation_groups,
+        (rot + 2) % book_rotation_groups,
+        (rot + 3) % book_rotation_groups,
+    }
+    budget = _InstructionBudget(max_instructions_per_book, max_total_instructions)
+
+    repay_loans_fifo(
+        response,
+        accounts,
+        simulation_config,
+        min_quantity=min_quantity,
+        rotate_key=ts // max(cadence_interval_ns, 1),
+    )
+
+    mids_scratch.clear()
+    book_rows: dict[int, tuple[Book, float, float, float]] = {}
+    for book_id, book in state.books.items():
+        t = _touch(book)
+        if t is None:
+            continue
+        best_bid, best_ask, mid = t
+        spread_r = (best_ask - best_bid) / mid if mid > 0 else 1.0
+        if spread_r > max_spread_ratio:
+            continue
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < min_spread_ticks:
+            continue
+        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
+            continue
+        if abs(tape_imbalance_ratio(book)) > 0.45:
+            continue
+        if not maker_fee_ok(accounts, book_id, max_fee_rate):
+            continue
+        mids_scratch[book_id] = mid
+        book_rows[book_id] = (book, best_bid, best_ask, mid)
+        last_mid[book_id] = mid
+
+    if not book_rows:
+        return
+
+    qty = round(max(min_quantity, max_quantity * quantity_scale), vdec)
+    qty = max(qty, min_quantity)
+    placed: set[int] = set()
+
+    # Phase 0 — complete round trips after maker fills (inside only, never touch-join)
+    requote_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
+    for book_id, comp_dir, fill_price in _iter_requote_hints(requote_hints):
+        row = book_rows.get(book_id)
+        if row is None or _has_loan(accounts, book_id):
+            continue
+        book, best_bid, best_ask, mid = row
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < min_spread_ticks:
+            continue
+        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
+            continue
+        if fill_price is not None:
+            comp_edge = _completion_rt_edge_ticks(
+                fill_price, comp_dir, best_bid, best_ask, tick, pdec
+            )
+            if comp_edge < min_rt_edge_ticks:
+                continue
+        fs = book_fill_score(
+            book, accounts, book_id, spread_ticks=spread_ticks, requote=True
+        )
+        requote_jobs.append((fs + 100.0, book_id, best_bid, best_ask, mid, comp_dir))
+    requote_jobs.sort(key=lambda x: -x[0])
+    requote_count = 0
+    for _fs, book_id, best_bid, best_ask, _mid, comp_dir in requote_jobs:
+        if requote_count >= max_requote_per_tick or len(placed) >= max_books_per_tick:
+            break
+        if book_id in placed:
+            continue
+        cancel_stale_orders(
+            response,
+            accounts[book_id],
+            book_id,
+            best_bid,
+            best_ask,
+            tick,
+            budget,
+            max_cancel=2,
+        )
+        price = _limit_price(comp_dir, best_bid, best_ask, tick, pdec, mode="inside")
+        account = accounts[book_id]
+        if comp_dir == OrderDirection.BUY:
+            if price >= best_ask or account.quote_balance.free < qty * price:
+                continue
+        elif price <= best_bid or account.base_balance.free < qty:
+            continue
+        if not budget.can_place(book_id, 1):
+            continue
+        place_limit(response, book_id, comp_dir, qty, price, expiry_period)
+        budget.mark(book_id, 1)
+        placed.add(book_id)
+        requote_count += 1
+        direction[book_id] = (
+            OrderDirection.SELL if comp_dir == OrderDirection.BUY else OrderDirection.BUY
+        )
+
+    for book_id, (_book, best_bid, best_ask, _mid) in sorted(book_rows.items()):
+        if budget.total >= max_total_instructions:
+            break
+        cancel_stale_orders(
+            response,
+            accounts[book_id],
+            book_id,
+            best_bid,
+            best_ask,
+            tick,
+            budget,
+            max_cancel=max_instructions_per_book,
+        )
+
+    flatten_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
+    for book_id, (_book, best_bid, best_ask, mid) in book_rows.items():
+        if _has_loan(accounts, book_id):
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        if abs(skew) < inventory_skew_soft:
+            continue
+        trade_dir = OrderDirection.SELL if skew > 0 else OrderDirection.BUY
+        flatten_jobs.append((abs(skew) * 100.0, book_id, best_bid, best_ask, mid, trade_dir))
+    flatten_jobs.sort(key=lambda x: -x[0])
+
+    for _prio, book_id, best_bid, best_ask, mid, trade_dir in flatten_jobs:
+        if budget.total >= max_total_instructions or len(placed) >= max_books_per_tick:
+            break
+        if book_id in placed:
+            continue
+        price = _limit_price(trade_dir, best_bid, best_ask, tick, pdec, mode="inside")
+        account = accounts[book_id]
+        if trade_dir == OrderDirection.BUY:
+            if price >= best_ask or account.quote_balance.free < qty * price:
+                continue
+        elif price <= best_bid or account.base_balance.free < qty:
+            continue
+        if not budget.can_place(book_id, 1):
+            continue
+        place_limit(response, book_id, trade_dir, qty, price, expiry_period)
+        budget.mark(book_id, 1)
+        placed.add(book_id)
+        direction[book_id] = (
+            OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
+        )
+
+    quote_candidates: list[tuple[float, int, float, float, float]] = []
+    for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
+        if book_id in placed or _has_loan(accounts, book_id):
+            continue
+        if (book_id % book_rotation_groups) not in active_rots:
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        if abs(skew) >= inventory_skew_soft * 0.85:
+            continue
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        fill_score = book_fill_score(
+            book, accounts, book_id, spread_ticks=spread_ticks, requote=False
+        )
+        if fill_score < min_fill_score:
+            continue
+        quote_candidates.append((fill_score, book_id, best_bid, best_ask, mid))
+    quote_candidates.sort(key=lambda x: -x[0])
+
+    quote_count = 0
+    for _fill_score, book_id, best_bid, best_ask, mid in quote_candidates:
+        if quote_count >= max_books_per_tick or budget.total >= max_total_instructions:
+            break
+        if book_id in placed:
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        if skew > 0.006:
+            trade_dir = OrderDirection.SELL
+        elif skew < -0.006:
+            trade_dir = OrderDirection.BUY
+        else:
+            trade_dir = (
+                OrderDirection.BUY if (book_id + rot) % 2 == 0 else OrderDirection.SELL
+            )
+        price = _limit_price(
+            trade_dir, best_bid, best_ask, tick, pdec, mode="inside"
+        )
+        account = accounts[book_id]
+        if trade_dir == OrderDirection.BUY:
+            if price >= best_ask or account.quote_balance.free < qty * price:
+                continue
+        elif price <= best_bid or account.base_balance.free < qty:
+            continue
+        if not budget.can_place(book_id, 1):
+            continue
+        place_limit(response, book_id, trade_dir, qty, price, expiry_period)
+        budget.mark(book_id, 1)
+        placed.add(book_id)
+        quote_count += 1
+        direction[book_id] = (
+            OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
+        )
+
+
 def turbo_recover_score_tick(
     response,
     state,
@@ -1367,3 +1642,5 @@ def turbo_recover_score_tick(
         direction[book_id] = (
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
+
+

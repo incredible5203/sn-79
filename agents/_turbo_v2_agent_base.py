@@ -17,6 +17,7 @@ from competitive_utils import (
     _InstructionBudget,
     param_bool,
     startup_cancel_all_orders,
+    turbo_power_score_tick,
     turbo_recover_score_tick,
     turbo_survive_score_tick,
     turbo_v2_kappa_score_tick,
@@ -114,6 +115,7 @@ _PROFILE_DEFAULTS_V2: dict[str, dict] = {
         "book_rotation_groups": 20,
         "cadence_interval_ns": 30_000_000_000,
         "max_spread_ratio": 0.0010,
+        "inactive_book_frac": 0.30,
         "inventory_skew_soft": 0.005,
         "inventory_skew_hard": 0.012,
         "max_requote_per_tick": 0,
@@ -139,6 +141,26 @@ _PROFILE_DEFAULTS_V2: dict[str, dict] = {
         "max_requote_per_tick": 0,
         "touch_join_on_requote": 0,
         "min_fill_score": 0.0,
+        "min_spread_ticks_rt": 4.0,
+        "min_rt_edge_ticks": 4.0,
+        "max_edge_per_tick": 0,
+    },
+    "power": {
+        "max_quantity": 0.32,
+        "quantity_scale": 0.92,
+        "max_books_per_tick": 10,
+        "max_two_sided_per_tick": 0,
+        "max_total_instructions": 26,
+        "max_instructions_per_book": 4,
+        "book_rotation_groups": 12,
+        "cadence_interval_ns": 20_000_000_000,
+        "max_spread_ratio": 0.0014,
+        "inactive_book_frac": 0.26,
+        "inventory_skew_soft": 0.015,
+        "inventory_skew_hard": 0.030,
+        "max_requote_per_tick": 6,
+        "touch_join_on_requote": 0,
+        "min_fill_score": 2.5,
         "min_spread_ticks_rt": 4.0,
         "min_rt_edge_ticks": 4.0,
         "max_edge_per_tick": 0,
@@ -294,7 +316,7 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
         self.direction: dict[int, OrderDirection] = {}
         self._last_mid: dict[int, float] = {}
         self._mids_scratch: dict[int, float] = {}
-        self._requote: dict[int, tuple[OrderDirection, int]] = {}
+        self._requote: dict[int, tuple[OrderDirection, int, float]] = {}
 
         self.debug_state_log = param_bool(
             getattr(self.config, "debug_state_log", 0), False
@@ -304,7 +326,7 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
         )
         self._debug_state_tick = 0
 
-        default_cancel_all = self.turbo_profile in ("recover", "survive")
+        default_cancel_all = self.turbo_profile in ("recover", "survive", "power")
         self.cancel_all_on_startup = param_bool(
             getattr(self.config, "cancel_all_on_startup", default_cancel_all),
             default_cancel_all,
@@ -328,21 +350,28 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
             return
         if event.makerAgentId != self.uid or event.bookId is None:
             return
-        self._requote[event.bookId] = (self._completion_side(event), 0)
+        self._requote[event.bookId] = (
+            self._completion_side(event),
+            0,
+            float(event.price),
+        )
 
     def _decay_requote(self) -> None:
         expired: list[int] = []
-        for book_id, (side, age) in self._requote.items():
+        for book_id, (side, age, fill_price) in self._requote.items():
             age += 1
             if age > self.requote_ttl_ticks:
                 expired.append(book_id)
             else:
-                self._requote[book_id] = (side, age)
+                self._requote[book_id] = (side, age, fill_price)
         for book_id in expired:
             del self._requote[book_id]
 
-    def _requote_hints(self) -> dict[int, OrderDirection]:
-        return {book_id: side for book_id, (side, _age) in self._requote.items()}
+    def _requote_hints(self) -> dict[int, tuple[OrderDirection, float]]:
+        return {
+            book_id: (side, fill_price)
+            for book_id, (side, _age, fill_price) in self._requote.items()
+        }
 
     def update(self, state: MarketSimulationStateUpdate) -> None:
         if self.debug_state_log and self._debug_state_tick < self.debug_state_log_ticks:
@@ -384,6 +413,36 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
         response = FinanceAgentResponse(agent_id=self.uid)
         if self._run_startup_cancel_all(response):
+            return response
+        if self.turbo_profile == "power":
+            self._decay_requote()
+            turbo_power_score_tick(
+                response,
+                state,
+                self.accounts,
+                self.simulation_config,
+                self.direction,
+                last_mid=self._last_mid,
+                mids_scratch=self._mids_scratch,
+                requote_hints=self._requote_hints(),
+                min_quantity=self.min_quantity,
+                max_quantity=self.max_quantity,
+                max_fee_rate=self.max_fee_rate,
+                quantity_scale=self.quantity_scale,
+                expiry_period=self.expiry_period,
+                inventory_skew_soft=self.inventory_skew_soft,
+                inventory_skew_hard=self.inventory_skew_hard,
+                max_books_per_tick=self.max_books_per_tick,
+                max_instructions_per_book=self.max_instructions_per_book,
+                max_total_instructions=self.max_total_instructions,
+                max_requote_per_tick=self.max_requote_per_tick,
+                book_rotation_groups=self.book_rotation_groups,
+                cadence_interval_ns=self.cadence_interval_ns,
+                max_spread_ratio=self.max_spread_ratio,
+                min_spread_ticks=self.min_spread_ticks,
+                min_rt_edge_ticks=self.min_rt_edge_ticks,
+                min_fill_score=self.min_fill_score,
+            )
             return response
         if self.turbo_profile == "recover":
             turbo_recover_score_tick(
