@@ -464,6 +464,27 @@ def tape_notional(book: Book) -> float:
     return total
 
 
+def tape_imbalance_ratio(book: Book) -> float:
+    """Buy vs sell tape notional in [-1, 1]. Extreme values often mean toxic flow."""
+    events = book.events
+    if not events:
+        return 0.0
+    buy_n = sell_n = 0.0
+    for event in events:
+        et = getattr(event, "type", None) or getattr(event, "y", None)
+        if et not in ("t", "ET"):
+            continue
+        n = event.quantity * event.price
+        if event.side == OrderDirection.BUY:
+            buy_n += n
+        else:
+            sell_n += n
+    total = buy_n + sell_n
+    if total <= 0:
+        return 0.0
+    return (buy_n - sell_n) / total
+
+
 def touch_depth(book: Book) -> float:
     if not book.bids or not book.asks:
         return 0.0
@@ -496,14 +517,47 @@ def book_fill_score(
 ) -> float:
     score = (
         spread_ticks * 2.2
-        + tape_notional(book) * 0.00015
+        + tape_notional(book) * 0.00004
         + touch_depth(book) * 0.35
         + maker_rebate_bonus(accounts, book_id)
         + mtr_maker_bonus(book)
     )
+    imb = abs(tape_imbalance_ratio(book))
+    if imb > 0.55:
+        score *= max(0.2, 1.0 - imb)
     if requote:
         score += 80.0
     return score
+
+
+def _limit_price(
+    trade_dir: OrderDirection,
+    best_bid: float,
+    best_ask: float,
+    tick: float,
+    pdec: int,
+    *,
+    mode: str,
+) -> float:
+    """
+    Price modes for maker orders:
+      inside     — one tick inside the spread (default, best for PnL)
+      join_touch — join bid (buy) or ask (sell) queue passively at touch
+      cross      — emergency flatten only (buy@ask / sell@bid)
+    """
+    if mode == "inside":
+        if trade_dir == OrderDirection.BUY:
+            return round_price(min(best_bid + tick, best_ask - tick), pdec)
+        return round_price(max(best_ask - tick, best_bid + tick), pdec)
+    if mode == "join_touch":
+        if trade_dir == OrderDirection.BUY:
+            return round_price(best_bid, pdec)
+        return round_price(best_ask, pdec)
+    if mode == "cross":
+        if trade_dir == OrderDirection.BUY:
+            return round_price(best_ask, pdec)
+        return round_price(best_bid, pdec)
+    raise ValueError(f"unknown price mode: {mode}")
 
 
 def cancel_stale_orders(
@@ -573,6 +627,7 @@ def turbo_v2_kappa_score_tick(
     max_requote_per_tick: int = 4,
     touch_join_on_requote: bool = False,
     min_fill_score: float = 0.0,
+    min_spread_ticks_rt: float = 3.0,
 ) -> None:
     """
     v2 scoring engine: stale cancel + fill-probability ranking + post-fill requote.
@@ -652,6 +707,23 @@ def turbo_v2_kappa_score_tick(
         )
         return max(qty, min_quantity)
 
+    def _requote_price_mode(
+        comp_dir: OrderDirection, skew: float, book_id: int
+    ) -> str:
+        """Prefer inside completion when touch-join would add to inventory skew."""
+        if not touch_join_on_requote:
+            return "inside"
+        if comp_dir == OrderDirection.SELL and skew > 0.006:
+            return "inside"
+        if comp_dir == OrderDirection.BUY and skew < -0.006:
+            return "inside"
+        spread_ticks = (
+            (book_rows[book_id][2] - book_rows[book_id][1]) / tick if tick > 0 else 0.0
+        )
+        if spread_ticks < min_spread_ticks_rt:
+            return "inside"
+        return "join_touch"
+
     def _place_limit(
         book_id: int,
         trade_dir: OrderDirection,
@@ -659,20 +731,14 @@ def turbo_v2_kappa_score_tick(
         best_bid: float,
         best_ask: float,
         *,
-        inside: bool,
+        mode: str = "inside",
     ) -> bool:
         if not budget.can_place(book_id, 1):
             return False
         account = accounts[book_id]
-        if inside:
-            if trade_dir == OrderDirection.BUY:
-                price = round_price(min(best_bid + tick, best_ask - tick), pdec)
-            else:
-                price = round_price(max(best_ask - tick, best_bid + tick), pdec)
-        elif trade_dir == OrderDirection.BUY:
-            price = round_price(best_ask, pdec)
-        else:
-            price = round_price(best_bid, pdec)
+        price = _limit_price(
+            trade_dir, best_bid, best_ask, tick, pdec, mode=mode
+        )
 
         if trade_dir == OrderDirection.BUY:
             if price >= best_ask or account.quote_balance.free < qty * price:
@@ -712,6 +778,8 @@ def turbo_v2_kappa_score_tick(
         if not maker_fee_ok(accounts, book_id, max_fee_rate):
             continue
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < min_spread_ticks_rt:
+            continue
         fs = book_fill_score(
             book, accounts, book_id, spread_ticks=spread_ticks, requote=True
         )
@@ -727,13 +795,14 @@ def turbo_v2_kappa_score_tick(
             continue
         _prep_book(book_id, best_bid, best_ask)
         strength = 8.0 + fs * 0.05
+        skew = inventory_skew(accounts, book_id, mid)
         if _place_limit(
             book_id,
             comp_dir,
             _qty(strength),
             best_bid,
             best_ask,
-            inside=not touch_join_on_requote,
+            mode=_requote_price_mode(comp_dir, skew, book_id),
         ):
             placed_books.add(book_id)
             requote_count += 1
@@ -775,10 +844,11 @@ def turbo_v2_kappa_score_tick(
             continue
 
         if (
-            abs(skew) <= inventory_skew_soft * 0.45
-            and spread_ticks >= 2.0
+            abs(skew) <= inventory_skew_soft * 0.35
+            and spread_ticks >= min_spread_ticks_rt
             and abs(ret) < reversion_threshold * 0.6
             and abs(rel) < relative_threshold * 1.2
+            and abs(tape_imbalance_ratio(book)) < 0.55
         ):
             if mp and mid > 0:
                 if abs((mp - mid) / mid) <= 0.00004:
@@ -838,7 +908,7 @@ def turbo_v2_kappa_score_tick(
             _qty(strength),
             best_bid,
             best_ask,
-            inside=not aggressive,
+            mode="cross" if aggressive else "inside",
         ):
             placed_books.add(book_id)
 
@@ -879,7 +949,7 @@ def turbo_v2_kappa_score_tick(
             continue
         _prep_book(book_id, best_bid, best_ask)
         if _place_limit(
-            book_id, trade_dir, _qty(strength), best_bid, best_ask, inside=True
+            book_id, trade_dir, _qty(strength), best_bid, best_ask, mode="inside"
         ):
             placed_books.add(book_id)
             edge_count += 1
