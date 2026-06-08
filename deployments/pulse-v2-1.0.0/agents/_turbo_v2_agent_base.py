@@ -206,8 +206,12 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
             getattr(self.config, "min_fill_score", defaults.get("min_fill_score", 0.0))
         )
         self.min_spread_ticks_rt = float(
-            getattr(self.config, "min_spread_ticks_rt", 3.0)
+            getattr(self.config, "min_spread_ticks_rt", 4.0)
         )
+        self.min_rt_edge_ticks = float(
+            getattr(self.config, "min_rt_edge_ticks", 2.5)
+        )
+        self.max_edge_per_tick = int(getattr(self.config, "max_edge_per_tick", 0))
         self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 6))
 
         self.direction: dict[int, OrderDirection] = {}
@@ -303,5 +307,7 @@ class TurboV2ScoringAgent(FinanceSimulationAgent):
             touch_join_on_requote=self.touch_join_on_requote,
             min_fill_score=self.min_fill_score,
             min_spread_ticks_rt=self.min_spread_ticks_rt,
+            min_rt_edge_ticks=self.min_rt_edge_ticks,
+            max_edge_per_tick=self.max_edge_per_tick,
         )
         return response

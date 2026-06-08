@@ -560,6 +560,26 @@ def _limit_price(
     raise ValueError(f"unknown price mode: {mode}")
 
 
+def _inside_spread_prices(
+    best_bid: float, best_ask: float, tick: float, pdec: int
+) -> tuple[float, float]:
+    buy_p = round_price(min(best_bid + tick, best_ask - tick), pdec)
+    sell_p = round_price(max(best_ask - tick, best_bid + tick), pdec)
+    return buy_p, sell_p
+
+
+def _rt_edge_ticks(
+    best_bid: float, best_ask: float, tick: float, pdec: int
+) -> float:
+    """Capturable inside-spread edge in tick units (must cover fees on round trip)."""
+    if tick <= 0:
+        return 0.0
+    buy_p, sell_p = _inside_spread_prices(best_bid, best_ask, tick, pdec)
+    if sell_p <= buy_p:
+        return 0.0
+    return (sell_p - buy_p) / tick
+
+
 def cancel_stale_orders(
     response,
     account,
@@ -627,7 +647,9 @@ def turbo_v2_kappa_score_tick(
     max_requote_per_tick: int = 4,
     touch_join_on_requote: bool = False,
     min_fill_score: float = 0.0,
-    min_spread_ticks_rt: float = 3.0,
+    min_spread_ticks_rt: float = 4.0,
+    min_rt_edge_ticks: float = 2.5,
+    max_edge_per_tick: int = 0,
 ) -> None:
     """
     v2 scoring engine: stale cancel + fill-probability ranking + post-fill requote.
@@ -653,23 +675,19 @@ def turbo_v2_kappa_score_tick(
     profile = (turbo_profile or "forge").lower()
     if profile == "pulse":
         two_sided_cap = max_two_sided_per_tick + 1
-        edge_slots = max(4, max_books_per_tick - two_sided_cap)
-        touch_join_on_requote = touch_join_on_requote or True
-        max_requote_per_tick = max(max_requote_per_tick, 5)
+        edge_slots = max_edge_per_tick if max_edge_per_tick >= 0 else max(2, max_books_per_tick - two_sided_cap)
     elif profile == "edge":
         two_sided_cap = min(2, max_two_sided_per_tick)
-        edge_slots = max_books_per_tick
+        edge_slots = max_edge_per_tick if max_edge_per_tick >= 0 else max_books_per_tick
     elif profile == "apex":
         two_sided_cap = min(3, max_two_sided_per_tick)
-        edge_slots = max(2, max_books_per_tick - two_sided_cap)
-        touch_join_on_requote = True
-        max_requote_per_tick = max(max_requote_per_tick, 6)
+        edge_slots = max_edge_per_tick if max_edge_per_tick >= 0 else max(2, max_books_per_tick - two_sided_cap)
     elif profile == "select":
         two_sided_cap = min(2, max_two_sided_per_tick)
-        edge_slots = max(4, max_books_per_tick - two_sided_cap)
+        edge_slots = max_edge_per_tick if max_edge_per_tick > 0 else 0
     else:
         two_sided_cap = max_two_sided_per_tick
-        edge_slots = max(3, max_books_per_tick - two_sided_cap)
+        edge_slots = max_edge_per_tick if max_edge_per_tick > 0 else 0
 
     budget = _InstructionBudget(max_instructions_per_book, max_total_instructions)
 
@@ -710,17 +728,12 @@ def turbo_v2_kappa_score_tick(
     def _requote_price_mode(
         comp_dir: OrderDirection, skew: float, book_id: int
     ) -> str:
-        """Prefer inside completion when touch-join would add to inventory skew."""
-        if not touch_join_on_requote:
+        """Inside-only completion unless neutral skew and explicit touch_join enabled."""
+        if comp_dir == OrderDirection.SELL and skew > 0.004:
             return "inside"
-        if comp_dir == OrderDirection.SELL and skew > 0.006:
+        if comp_dir == OrderDirection.BUY and skew < -0.004:
             return "inside"
-        if comp_dir == OrderDirection.BUY and skew < -0.006:
-            return "inside"
-        spread_ticks = (
-            (book_rows[book_id][2] - book_rows[book_id][1]) / tick if tick > 0 else 0.0
-        )
-        if spread_ticks < min_spread_ticks_rt:
+        if not touch_join_on_requote or abs(skew) > 0.003:
             return "inside"
         return "join_touch"
 
@@ -778,7 +791,8 @@ def turbo_v2_kappa_score_tick(
         if not maker_fee_ok(accounts, book_id, max_fee_rate):
             continue
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-        if spread_ticks < min_spread_ticks_rt:
+        rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
+        if spread_ticks < min_spread_ticks_rt or rt_edge < min_rt_edge_ticks:
             continue
         fs = book_fill_score(
             book, accounts, book_id, spread_ticks=spread_ticks, requote=True
@@ -810,6 +824,12 @@ def turbo_v2_kappa_score_tick(
     flatten_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
     two_sided: list[tuple[float, int, float, float, float]] = []
     edge_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
+    skewed_books = sum(
+        1
+        for bid, (_book, _bb, _ba, mid) in book_rows.items()
+        if abs(inventory_skew(accounts, bid, mid)) >= inventory_skew_soft * 0.45
+    )
+    risk_off = skewed_books >= 4
 
     for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
         if book_id in placed_books:
@@ -832,7 +852,7 @@ def turbo_v2_kappa_score_tick(
         quality = fill_sc * max(0.1, 1.0 - 2.5 * abs(skew))
         loaned = _has_loan(accounts, book_id)
 
-        if abs(skew) >= inventory_skew_soft:
+        if abs(skew) >= inventory_skew_soft * 0.65:
             trade_dir = OrderDirection.SELL if skew > 0 else OrderDirection.BUY
             strength = 12.0 + abs(skew) * 30.0 + fill_sc * 0.02
             flatten_jobs.append(
@@ -843,12 +863,16 @@ def turbo_v2_kappa_score_tick(
         if loaned:
             continue
 
+        if risk_off or abs(skew) >= inventory_skew_soft * 0.35:
+            continue
+
+        rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
         if (
-            abs(skew) <= inventory_skew_soft * 0.35
-            and spread_ticks >= min_spread_ticks_rt
+            spread_ticks >= min_spread_ticks_rt
+            and rt_edge >= min_rt_edge_ticks
             and abs(ret) < reversion_threshold * 0.6
             and abs(rel) < relative_threshold * 1.2
-            and abs(tape_imbalance_ratio(book)) < 0.55
+            and abs(tape_imbalance_ratio(book)) < 0.45
         ):
             if mp and mid > 0:
                 if abs((mp - mid) / mid) <= 0.00004:
@@ -856,43 +880,44 @@ def turbo_v2_kappa_score_tick(
             else:
                 two_sided.append((quality, book_id, best_bid, best_ask, mid))
 
-        trade_dir: OrderDirection | None = None
-        strength = 0.0
-        if rel >= relative_threshold and skew <= inventory_skew_soft * 0.5:
-            trade_dir, strength = OrderDirection.SELL, abs(rel) / relative_threshold
-        elif rel <= -relative_threshold and skew >= -inventory_skew_soft * 0.5:
-            trade_dir, strength = OrderDirection.BUY, abs(rel) / relative_threshold
+        if max_edge_per_tick > 0 and rt_edge >= min_rt_edge_ticks:
+            trade_dir: OrderDirection | None = None
+            strength = 0.0
+            if rel >= relative_threshold and skew <= inventory_skew_soft * 0.35:
+                trade_dir, strength = OrderDirection.SELL, abs(rel) / relative_threshold
+            elif rel <= -relative_threshold and skew >= -inventory_skew_soft * 0.35:
+                trade_dir, strength = OrderDirection.BUY, abs(rel) / relative_threshold
 
-        if ret >= reversion_threshold and trade_dir != OrderDirection.BUY:
-            if trade_dir is None:
-                trade_dir, strength = OrderDirection.SELL, abs(ret) / reversion_threshold
-            elif trade_dir == OrderDirection.SELL:
-                strength += abs(ret) / reversion_threshold
-        elif ret <= -reversion_threshold and trade_dir != OrderDirection.SELL:
-            if trade_dir is None:
-                trade_dir, strength = OrderDirection.BUY, abs(ret) / reversion_threshold
-            elif trade_dir == OrderDirection.BUY:
-                strength += abs(ret) / reversion_threshold
+            if ret >= reversion_threshold and trade_dir != OrderDirection.BUY:
+                if trade_dir is None:
+                    trade_dir, strength = OrderDirection.SELL, abs(ret) / reversion_threshold
+                elif trade_dir == OrderDirection.SELL:
+                    strength += abs(ret) / reversion_threshold
+            elif ret <= -reversion_threshold and trade_dir != OrderDirection.SELL:
+                if trade_dir is None:
+                    trade_dir, strength = OrderDirection.BUY, abs(ret) / reversion_threshold
+                elif trade_dir == OrderDirection.BUY:
+                    strength += abs(ret) / reversion_threshold
 
-        if trade_dir is None or strength < 1.0:
-            continue
+            if trade_dir is not None and strength >= 1.0:
+                if mp and mid > 0:
+                    edge = (mp - mid) / mid
+                    if trade_dir == OrderDirection.BUY and edge > 0.000025:
+                        trade_dir = None
+                    if trade_dir == OrderDirection.SELL and edge < -0.000025:
+                        trade_dir = None
 
-        if mp and mid > 0:
-            edge = (mp - mid) / mid
-            if trade_dir == OrderDirection.BUY and edge > 0.000025:
-                continue
-            if trade_dir == OrderDirection.SELL and edge < -0.000025:
-                continue
+            if trade_dir is not None and strength >= 1.0:
+                prev = direction.get(book_id)
+                if prev == OrderDirection.BUY and trade_dir == OrderDirection.BUY and skew > 0.018:
+                    trade_dir = None
+                if prev == OrderDirection.SELL and trade_dir == OrderDirection.SELL and skew < -0.018:
+                    trade_dir = None
 
-        prev = direction.get(book_id)
-        if prev == OrderDirection.BUY and trade_dir == OrderDirection.BUY and skew > 0.018:
-            continue
-        if prev == OrderDirection.SELL and trade_dir == OrderDirection.SELL and skew < -0.018:
-            continue
-
-        edge_jobs.append(
-            (strength * quality, book_id, best_bid, best_ask, mid, trade_dir)
-        )
+            if trade_dir is not None and strength >= 1.0:
+                edge_jobs.append(
+                    (strength * quality, book_id, best_bid, best_ask, mid, trade_dir)
+                )
 
     flatten_jobs.sort(key=lambda x: -x[0])
     for strength, book_id, best_bid, best_ask, mid, trade_dir in flatten_jobs:
@@ -926,9 +951,8 @@ def turbo_v2_kappa_score_tick(
         _prep_book(book_id, best_bid, best_ask)
         qty = _qty(quality)
         account = accounts[book_id]
-        buy_p = round_price(min(best_bid + tick, best_ask - tick), pdec)
-        sell_p = round_price(max(best_ask - tick, best_bid + tick), pdec)
-        if buy_p >= sell_p:
+        buy_p, sell_p = _inside_spread_prices(best_bid, best_ask, tick, pdec)
+        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
             continue
         if account.quote_balance.free < qty * buy_p or account.base_balance.free < qty:
             continue
