@@ -1,0 +1,21 @@
+# SteadyPulseAgent — conservative non-Turbo maker (UID 65)
+from __future__ import annotations
+
+import os
+import sys
+
+_agent_dir = os.path.dirname(os.path.abspath(__file__))
+if _agent_dir not in sys.path:
+    sys.path.insert(0, _agent_dir)
+
+from _steady_maker_base import SteadyMakerAgent
+from taos.common.agents import launch
+
+
+class SteadyPulseAgent(SteadyMakerAgent):
+    agent_label = "SteadyPulseAgent"
+    default_steady_profile = "pulse"
+
+
+if __name__ == "__main__":
+    launch(SteadyPulseAgent)
