@@ -181,12 +181,12 @@ For **your UID**, verify:
 
 Strong miners relative to the field typically show:
 
-- High **median Kappa** with **low Penalty** (consistent across books, not one-book gambling)
+- High **median Kappa** with **low Penalty** (target **Penalty = 0** — consistent across books)
 - Positive **realized PnL**, not only mark-to-market inventory gains
-- Mostly **Success** on Requests (stay under validator timeout, default ~3s)
+- **Trading score** rising (≈ 79% Kappa + 21% PnL) → **incentive** follows on-chain EMA
+- Mostly **Success** on Requests (stay under validator timeout, default ~3s; use `lazy_load=1`)
 - Steady **round-trip volume** without hitting the **capital turnover cap** early
-- **Performance** rank improving or stable over time, not a single spike
-- Trades on **all books** (FAQ: neglecting books hurts score; up to 37.5% inactive books tolerated, excess penalized)
+- Maker **LIMIT** fills dominating logs — not `FAILED TO PLACE` / `EXCEEDING_LOAN` spam
 
 ### Common gaps vs top miners
 
@@ -196,8 +196,10 @@ Strong miners relative to the field typically show:
 | Low Pos, low Kappa | Poor risk-adjusted round-trips | Realized PnL plot; trade less or manage downside |
 | No score after register | Insufficient history | Wait for min realized observations + lookback window |
 | High Pos but low incentive | Weight lag / validator disagreement | Compare across validators; metagraph incentive |
-| Many timeouts | Slow agent or network | Requests plot; enable `lazy_load=1`; move closer to validators |
-| Volume cap hit | Over-trading | Daily volume plot; `accounts[book_id]['traded_volume']` in agent code |
+| Many timeouts | Slow agent or network | Requests plot; enable `lazy_load=1`; use Turbo agents |
+| Volume cap hit | Over-trading | Daily volume plot; cap instructions per tick |
+| Penalty > 0 | Outlier weak books | Per-book Kappa; use turbo rotation + inactive_book_frac skip |
+| Score flat, logs busy | Too many failed orders | Reduce max_books_per_tick; maker-only; see Turbo agents |
 
 ---
 

@@ -1,6 +1,7 @@
 # SN-79 Market Data Miners Receive from Validators
 
 > **Scope:** Trading miners on netuid **79** (mainnet) / **366** (testnet)  
+> **Package:** τaos **0.4.5**  
 > **Primary type:** `MarketSimulationStateUpdate` (validator → miner)  
 > **Related docs:** [SN-79-miner-validator-protocol.md](./SN-79-miner-validator-protocol.md), [SN-79-what-market-is-this.md](./SN-79-what-market-is-this.md)  
 > **Sources:** `taos/im/protocol`, `taos/im/validator/query.py`, `taos/im/utils/compress.py`, `simulate/trading/.../ValidatorRequest.hpp`
@@ -337,4 +338,5 @@ Validators send raw state, not indicators:
 5. **128 independent books** — same asset rules, different microstructure; cross-book signals are first-class.
 6. **Notices lag books by one tick** — current books are "now"; notices tell you what happened to your last orders.
 
-For the full request/response lifecycle, scoring, and failed-order rules, see [SN-79-miner-validator-protocol.md](./SN-79-miner-validator-protocol.md).
+For the full request/response lifecycle, scoring, and failed-order rules, see [SN-79-miner-validator-protocol.md](./SN-79-miner-validator-protocol.md).  
+For high-score agent implementation, see `agents/competitive_utils.py` and [SN-79-testnet-miner-guide.md](./SN-79-testnet-miner-guide.md#turbo-scoring-agents-recommended).

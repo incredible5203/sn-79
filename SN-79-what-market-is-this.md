@@ -1,6 +1,7 @@
 # SN-79: What “Market” Is This?
 
 > **Scope:** Trading miners on netuid **79** (mainnet) / **366** (testnet)  
+> **Package:** τaos **0.4.5**  
 > **Related docs:** [SN-79-market-data-from-validators.md](./SN-79-market-data-from-validators.md), [SN-79-miner-validator-protocol.md](./SN-79-miner-validator-protocol.md), [SN-79-subnet-analysis.md](./SN-79-subnet-analysis.md)  
 > **Sources:** `README.md`, `taos/im/config/__init__.py`, `simulate/trading/run/config/simulation_0.xml`, dashboard docs
 

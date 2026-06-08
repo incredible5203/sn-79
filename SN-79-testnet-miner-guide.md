@@ -412,6 +412,72 @@ See [SN-79-miner-comparison-guide.md](./SN-79-miner-comparison-guide.md) (use th
 
 ---
 
+## Turbo scoring agents (recommended)
+
+The example agents in `agents/` (RandomMaker, SimpleRegressor, etc.) are for learning only. For competitive **Realized PnL**, **Median Kappa3**, **Kappa Score**, and **Penalty → 0**, use the **Turbo** family:
+
+| Script | Agent | Profile | Best for |
+|--------|-------|---------|----------|
+| `run_miner_power1.sh` | **TurboPulseAgent** | `pulse` | Fast round-trip / κ₃ (two-sided spread capture) |
+| `run_miner_power2.sh` | **TurboEdgeAgent** | `edge` | Cross-book median + reversion |
+| `run_miner_power3.sh` | **TurboForgeAgent** | `forge` | Balanced default (start here) |
+
+### Turbo v2 (higher round-trip quality)
+
+When you have instruction headroom (≤4/book, ≤28–30/tick) and want **better fill rate** and **completed round trips**, use v2. Same scoring targets; execution is smarter:
+
+| Script | Agent | Profile | Best for |
+|--------|-------|---------|----------|
+| `run_miner_power4.sh` | **TurboForgeV2Agent** | `forge` | **Recommended v2** — balanced quality upgrade |
+| `run_miner_power5.sh` | **TurboPulseV2Agent** | `pulse` | Max round-trip throughput + touch-join completions |
+| `run_miner_power6.sh` | **TurboEdgeV2Agent** | `edge` | Cross-book edge with fill-score filtering |
+| `run_miner_power7.sh` | **TurboApexV2Agent** | `apex` | Theoretical optimum blend (fewer books, highest quality) |
+| `run_miner_power8.sh` | **TurboSelectV2Agent** | `select` | Top fill-probability books only |
+
+**v2 improvements over v1:**
+
+- **Cancel stale limits** off-touch before re-quoting (budget-aware)
+- **Fill-score ranking** — spread, tape activity, touch depth, maker rebate, MTR
+- **Post-fill requote** — after a maker fill, priority quote on the completion leg (`onTrade`)
+- **Touch-join** on completion (pulse/apex/select) for higher fill probability
+
+Engine: `agents/competitive_utils.py` → `turbo_v2_kappa_score_tick`. Key params: `cancel_stale=1`, `max_requote_per_tick`, `min_fill_score`, `touch_join_on_requote`.
+
+### Setup
+
+1. Edit the run script — fill in:
+
+   ```bash
+   PM2_NAME=miner240
+   EXPECTED_UID=240
+   WALLET_NAME=your-coldkey
+   HOTKEY_NAME=your-hotkey
+   AXON_PORT=8110
+   ```
+
+2. Launch:
+
+   ```bash
+   ./run_miner_power3.sh
+   ```
+
+3. Monitor [testnet.simulate.trading](https://testnet.simulate.trading) — scores lag 45–90+ min after relaunch.
+
+### Scoring targets
+
+| Dashboard metric | Turbo design lever |
+|------------------|-------------------|
+| Realized PnL | Maker limits at touch; inventory flatten |
+| Median Kappa3 | Two-sided round trips across rotated books |
+| Kappa Score | Median κ − outlier penalty (penalty → 0) |
+| Trading Score | ≈ 79% Kappa + 21% PnL |
+| Penalty | Consistent per-book behavior; skip worst 30% |
+| Incentive | Follows trading score EMA on-chain |
+
+Engine v1: `turbo_kappa_score_tick` · v2: `turbo_v2_kappa_score_tick`. Always use `lazy_load=1`.
+
+---
+
 ## Troubleshooting
 
 ### Validators never query me / all timeouts

@@ -2,6 +2,7 @@
 
 > **Repository:** [taos-im/sn-79](https://github.com/taos-im/sn-79)  
 > **Netuid:** 79 (mainnet), 366 (testnet)  
+> **Package version:** τaos **0.4.5** (branch `testnet` / `main`)  
 > **Last analyzed:** June 2026  
 > **Sources:** README, agents guide, validator/miner code, reward logic, GenTRX docs
 
@@ -43,7 +44,7 @@ Outputs are intended for:
 - AI/ML training on realistic order flow
 - Future live exchange integration
 
-The mechanism is designed so that **good trading behavior in simulation** produces **useful, statistically significant datasets** across many parallel order book realizations (~40 books today, targeting 1,000+).
+The mechanism is designed so that **good trading behavior in simulation** produces **useful, statistically significant datasets** across many parallel order book realizations (**128 books** in current sim config: 16 books × 8 blocks).
 
 ---
 
@@ -55,7 +56,7 @@ The mechanism is designed so that **good trading behavior in simulation** produc
 ┌─────────────────────────────────────────────────────────────────┐
 │                     C++ Simulator (taosim)                      │
 │  • MAXE-based agent-based market simulation                     │
-│  • ~40 parallel order books + ~1000 background agents each      │
+│  • ~128 parallel order books + background agents per realization      │
 │  • Full L3 order book + matching engine                         │
 │  • Pauses while waiting for miner responses                     │
 └──────────────────────────┬──────────────────────────────────────┘
@@ -557,9 +558,9 @@ Public dashboards at [taos.simulate.trading](https://taos.simulate.trading) show
 ### Operational
 
 9. **Low latency to validators** — reduce network RTT
-10. **Enable `lazy_load=1`** — faster deserialization, fewer timeouts
-11. **Test on testnet (366)** before mainnet deployment
-12. **Monitor dashboard** — track score, volume cap proximity, response times
+10. **Enable `lazy_load=1`** — faster deserialization, fewer timeouts (required for turbo agents)
+11. **Use turbo scoring agents on testnet** — `TurboPulseAgent` / `TurboEdgeAgent` / `TurboForgeAgent` via `run_miner_power1.sh`–`power3.sh`
+12. **Monitor dashboard** — track score, volume cap proximity, response times; target **Penalty → 0**
 
 ---
 
@@ -584,8 +585,9 @@ Public dashboards at [taos.simulate.trading](https://taos.simulate.trading) show
 | Area | Recommendation |
 |------|----------------|
 | **State parsing** | Use `lazy_load=1`; only parse books/fields you need |
-| **Parallelization** | Process 40+ books concurrently if strategy is compute-heavy |
+| **Parallelization** | Process 128 books with rotation; cap instructions (≤4/book, ≤28/tick) |
 | **Event handling** | Implement `onTrade`, `onOrderAccepted`, etc. for stateful strategies |
+| **Scoring engine** | `agents/competitive_utils.py` → `turbo_kappa_score_tick` (maker-only, loan-safe) |
 | **L3 event analysis** | Use `book.events` for microstructure signals (see `ImbalanceAgent`) |
 | **Instruction efficiency** | Max 5 instructions/book — prioritize highest-value actions |
 | **Self-trade prevention** | Use appropriate STP settings |
@@ -716,6 +718,7 @@ Public dashboards at [taos.simulate.trading](https://taos.simulate.trading) show
 | **Instructions** | Market/limit orders, cancels, close positions |
 | **Testing** | Local proxy (`agents/proxy/`) |
 | **Examples** | `~/.taos/agents/` (copied from `agents/` on install) |
+| **High-score agents (testnet branch)** | `TurboPulseAgent`, `TurboEdgeAgent`, `TurboForgeAgent` — see [SN-79-testnet-miner-guide.md](./SN-79-testnet-miner-guide.md#turbo-scoring-agents-recommended) |
 
 ### Registration & wallets
 

@@ -1,6 +1,7 @@
 # SN-79 Miner ↔ Validator Protocol Reference
 
 > **Scope:** Trading miners on netuid **79** (mainnet) / **366** (testnet)  
+> **Package:** τaos **0.4.5**  
 > **Primary types:** `MarketSimulationStateUpdate` (validator → miner), `FinanceAgentResponse` (miner → validator)  
 > **Sources:** `taos/im/protocol`, `taos/im/agents`, `taos/im/validator/query.py`, `taos/im/validator/reward.py`, `agents/README.md`  
 > **See also:** [Market data from validators](./SN-79-market-data-from-validators.md) · [What market is this?](./SN-79-what-market-is-this.md)
@@ -420,6 +421,8 @@ View with: `pm2 logs <miner_name>` (no filtering required).
 | `quantity < 0.25` | `MINIMUM_ORDER_SIZE_VIOLATION` | Zero execution |
 | >5 instructions/book | Validator drops excess | Missed intended trades |
 | Slow Python / huge loops | Timeout | **Zero** instructions entire tick |
+| `debug_state_log=1` on every tick | Slow respond | Latency penalty; score grows slowly |
+| >15 books/tick + 7 two-sided | Instruction reject storm | Failed orders don't score |
 | Same bad books every tick | High **penalty** | Kappa median − outlier penalty |
 
 ---
@@ -447,5 +450,7 @@ Every scoring.interval: validator updates Kappa/PnL moving averages → weights 
 | `sn-79/taos/im/protocol/models.py` | `Book`, `Account`, `Order` |
 | `sn-79/agents/README.md` | Agent API and field reference |
 | `sn-79/taos/im/validator/reward.py` | Kappa + PnL scoring |
+| `sn-79/agents/competitive_utils.py` | `turbo_kappa_score_tick` (high-score testnet agents) |
+| `sn-79/agents/TurboForgeAgent.py` | Recommended balanced turbo agent |
 | `sn-79/taos/im/validator/query.py` | Response validation |
 | `SN-79-subnet-analysis.md` | Broader subnet architecture and reward tuning |
