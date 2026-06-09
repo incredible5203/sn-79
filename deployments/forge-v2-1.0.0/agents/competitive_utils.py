@@ -1602,6 +1602,7 @@ def ascend_score_tick(
     deep_spread_ticks: float = 11.0,
     inactive_book_frac: float = 0.25,
     risk_off_skewed_books: int = 3,
+    two_sided_wide_ticks: float = 0.0,
 ) -> None:
     """
     Ascend scoring engine — fast κ growth, Penalty → 0, positive realized PnL.
@@ -1796,12 +1797,6 @@ def ascend_score_tick(
     if risk_off:
         return
 
-    pending_completions = len(requote_hints)
-    quote_book_cap = max(
-        1,
-        max_books_per_tick - min(pending_completions, max_books_per_tick - 1),
-    )
-
     quote_candidates: list[tuple[float, int, Book, float, float, float]] = []
     for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
         if book_id in placed or _has_loan(accounts, book_id):
@@ -1818,9 +1813,9 @@ def ascend_score_tick(
             continue
         traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
         if traded < cold_book_volume_threshold * 0.1:
-            cold_bonus = 4.0
+            cold_bonus = 6.0
         elif traded < cold_book_volume_threshold:
-            cold_bonus = 2.0
+            cold_bonus = 3.0
         else:
             cold_bonus = 0.0
         fill_sc = book_fill_score(
@@ -1836,11 +1831,49 @@ def ascend_score_tick(
 
     quote_count = 0
     for _rank, book_id, book, best_bid, best_ask, mid in quote_candidates:
-        if quote_count >= quote_book_cap or budget.total >= max_total_instructions:
+        if quote_count >= max_books_per_tick or budget.total >= max_total_instructions:
             break
         if book_id in placed:
             continue
         skew = inventory_skew(accounts, book_id, mid)
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        depth = base_depth + 1 if spread_ticks >= deep_spread_ticks else base_depth
+        account = accounts[book_id]
+
+        if (
+            two_sided_wide_ticks > 0
+            and spread_ticks >= two_sided_wide_ticks
+            and abs(skew) < 0.001
+            and budget.can_place(book_id, 2)
+        ):
+            buy_price = _limit_price(
+                OrderDirection.BUY, best_bid, best_ask, tick, pdec,
+                mode="inside", depth_ticks=depth,
+            )
+            sell_price = _limit_price(
+                OrderDirection.SELL, best_bid, best_ask, tick, pdec,
+                mode="inside", depth_ticks=depth,
+            )
+            if (
+                buy_price < best_ask
+                and sell_price > best_bid
+                and buy_price < sell_price
+                and account.quote_balance.free >= qty * buy_price
+                and account.base_balance.free >= qty
+            ):
+                place_limit(
+                    response, book_id, OrderDirection.BUY, qty, buy_price,
+                    expiry_period, volume_decimals=vdec, min_quantity=min_quantity,
+                )
+                place_limit(
+                    response, book_id, OrderDirection.SELL, qty, sell_price,
+                    expiry_period, volume_decimals=vdec, min_quantity=min_quantity,
+                )
+                budget.mark(book_id, 2)
+                placed.add(book_id)
+                quote_count += 1
+                continue
+
         mp = microprice(book)
         if mp is None or tick <= 0:
             continue
@@ -1855,12 +1888,9 @@ def ascend_score_tick(
             trade_dir = OrderDirection.SELL
         else:
             continue
-        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-        depth = base_depth + 1 if spread_ticks >= deep_spread_ticks else base_depth
         price = _limit_price(
             trade_dir, best_bid, best_ask, tick, pdec, mode="inside", depth_ticks=depth
         )
-        account = accounts[book_id]
         if trade_dir == OrderDirection.BUY:
             if price >= best_ask or account.quote_balance.free < qty * price:
                 continue
