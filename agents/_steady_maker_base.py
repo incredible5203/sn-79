@@ -26,63 +26,66 @@ from taos.im.protocol.instructions import OrderDirection
 
 _PROFILE_DEFAULTS: dict[str, dict] = {
     "apex": {
-        "max_books_per_tick": 6,
-        "max_total_instructions": 22,
-        "max_instructions_per_book": 4,
-        "max_requote_per_tick": 5,
-        "book_rotation_groups": 12,
-        "cadence_interval_ns": 22_000_000_000,
-        "rotation_windows": 3,
-        "min_spread_ticks": 8.0,
-        "min_quote_spread_ticks": 9.0,
-        "min_rt_edge_ticks": 7.0,
-        "min_completion_rt_edge_ticks": 8.0,
-        "min_microprice_edge_ticks": 2.0,
-        "inside_depth_ticks": 2,
-        "use_fill_score_ranking": True,
-        "max_spread_ratio": 0.0010,
-        "inventory_skew_soft": 0.004,
-        "inventory_skew_hard": 0.010,
-        "cold_book_volume_threshold": 500.0,
-    },
-    "pulse": {
-        "max_books_per_tick": 6,
-        "max_total_instructions": 22,
-        "max_instructions_per_book": 4,
-        "max_requote_per_tick": 5,
-        "book_rotation_groups": 12,
-        "cadence_interval_ns": 20_000_000_000,
-        "rotation_windows": 3,
-        "min_spread_ticks": 8.0,
-        "min_quote_spread_ticks": 9.0,
-        "min_rt_edge_ticks": 7.0,
-        "min_completion_rt_edge_ticks": 8.0,
-        "min_microprice_edge_ticks": 2.0,
-        "inside_depth_ticks": 2,
-        "use_fill_score_ranking": True,
-        "max_spread_ratio": 0.0010,
-        "inventory_skew_soft": 0.005,
-        "inventory_skew_hard": 0.012,
-        "cold_book_volume_threshold": 500.0,
-    },
-    "forge": {
-        "max_books_per_tick": 5,
-        "max_total_instructions": 20,
-        "max_instructions_per_book": 4,
-        "max_requote_per_tick": 4,
-        "book_rotation_groups": 14,
-        "cadence_interval_ns": 24_000_000_000,
-        "rotation_windows": 3,
+        "max_books_per_tick": 2,
+        "max_total_instructions": 6,
+        "max_instructions_per_book": 2,
+        "max_requote_per_tick": 3,
+        "book_rotation_groups": 26,
+        "cadence_interval_ns": 36_000_000_000,
+        "rotation_windows": 1,
         "min_spread_ticks": 8.0,
         "min_quote_spread_ticks": 10.0,
         "min_rt_edge_ticks": 7.0,
-        "min_completion_rt_edge_ticks": 8.0,
-        "min_microprice_edge_ticks": 2.0,
-        "inside_depth_ticks": 2,
-        "use_fill_score_ranking": True,
-        "max_spread_ratio": 0.0010,
+        "min_quote_rt_edge_ticks": 8.0,
+        "min_completion_rt_edge_ticks": 9.0,
+        "min_microprice_edge_ticks": 2.5,
+        "inside_depth_ticks": 1,
+        "use_fill_score_ranking": False,
+        "max_spread_ratio": 0.0009,
         "inventory_skew_soft": 0.004,
+        "inventory_skew_hard": 0.009,
+        "cold_book_volume_threshold": 500.0,
+    },
+    "pulse": {
+        "max_books_per_tick": 2,
+        "max_total_instructions": 6,
+        "max_instructions_per_book": 2,
+        "max_requote_per_tick": 3,
+        "book_rotation_groups": 24,
+        "cadence_interval_ns": 34_000_000_000,
+        "rotation_windows": 1,
+        "min_spread_ticks": 8.0,
+        "min_quote_spread_ticks": 10.0,
+        "min_rt_edge_ticks": 7.0,
+        "min_quote_rt_edge_ticks": 8.0,
+        "min_completion_rt_edge_ticks": 9.0,
+        "min_microprice_edge_ticks": 2.5,
+        "inside_depth_ticks": 1,
+        "use_fill_score_ranking": False,
+        "max_spread_ratio": 0.0009,
+        "inventory_skew_soft": 0.005,
         "inventory_skew_hard": 0.010,
+        "cold_book_volume_threshold": 500.0,
+    },
+    "forge": {
+        "max_books_per_tick": 2,
+        "max_total_instructions": 6,
+        "max_instructions_per_book": 2,
+        "max_requote_per_tick": 2,
+        "book_rotation_groups": 28,
+        "cadence_interval_ns": 38_000_000_000,
+        "rotation_windows": 1,
+        "min_spread_ticks": 8.0,
+        "min_quote_spread_ticks": 11.0,
+        "min_rt_edge_ticks": 7.0,
+        "min_quote_rt_edge_ticks": 9.0,
+        "min_completion_rt_edge_ticks": 9.0,
+        "min_microprice_edge_ticks": 2.5,
+        "inside_depth_ticks": 1,
+        "use_fill_score_ranking": False,
+        "max_spread_ratio": 0.0009,
+        "inventory_skew_soft": 0.004,
+        "inventory_skew_hard": 0.009,
         "cold_book_volume_threshold": 500.0,
     },
 }
@@ -225,6 +228,16 @@ class SteadyMakerAgent(FinanceSimulationAgent):
                 ),
             )
         )
+        self.min_quote_rt_edge_ticks = float(
+            getattr(
+                self.config,
+                "min_quote_rt_edge_ticks",
+                defaults.get(
+                    "min_quote_rt_edge_ticks",
+                    defaults.get("min_rt_edge_ticks", 7.0),
+                ),
+            )
+        )
         self.rotation_windows = int(
             getattr(
                 self.config,
@@ -250,8 +263,8 @@ class SteadyMakerAgent(FinanceSimulationAgent):
         self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 8))
 
         self.cancel_all_on_startup = param_bool(
-            getattr(self.config, "cancel_all_on_startup", False),
-            False,
+            getattr(self.config, "cancel_all_on_startup", True),
+            True,
         )
         self._startup_cancel_active = self.cancel_all_on_startup
 
@@ -269,6 +282,7 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             f"min_rt_edge={self.min_rt_edge_ticks} "
             f"min_comp_edge={self.min_completion_rt_edge_ticks} "
             f"min_quote_spread={self.min_quote_spread_ticks} "
+            f"min_quote_rt={self.min_quote_rt_edge_ticks} "
             f"min_mp_edge={self.min_microprice_edge_ticks} "
             f"depth={self.inside_depth_ticks} rot_win={self.rotation_windows} "
             f"requote={self.max_requote_per_tick} "
@@ -358,6 +372,7 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             min_rt_edge_ticks=self.min_rt_edge_ticks,
             min_completion_rt_edge_ticks=self.min_completion_rt_edge_ticks,
             min_quote_spread_ticks=self.min_quote_spread_ticks,
+            min_quote_rt_edge_ticks=self.min_quote_rt_edge_ticks,
             min_microprice_edge_ticks=self.min_microprice_edge_ticks,
             max_requote_per_tick=self.max_requote_per_tick,
             max_tape_imbalance=self.max_tape_imbalance,

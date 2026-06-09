@@ -1278,6 +1278,7 @@ def steady_maker_score_tick(
     min_completion_rt_edge_ticks: float | None = None,
     min_microprice_edge_ticks: float = 1.5,
     min_quote_spread_ticks: float | None = None,
+    min_quote_rt_edge_ticks: float | None = None,
     max_tape_imbalance: float = 0.28,
     cold_book_volume_threshold: float = 500.0,
     rotation_windows: int = 1,
@@ -1300,6 +1301,11 @@ def steady_maker_score_tick(
         min_spread_ticks
         if min_quote_spread_ticks is None
         else min_quote_spread_ticks
+    )
+    quote_rt_edge = (
+        min_rt_edge_ticks
+        if min_quote_rt_edge_ticks is None
+        else min_quote_rt_edge_ticks
     )
     vdec = simulation_config.volumeDecimals
     pdec = simulation_config.priceDecimals
@@ -1484,11 +1490,13 @@ def steady_maker_score_tick(
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
         if spread_ticks < quote_spread_min:
             continue
+        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < quote_rt_edge:
+            continue
         traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
         cold_bonus = (
-            6.0
+            2.0
             if traded < cold_book_volume_threshold * 0.1
-            else (3.0 if traded < cold_book_volume_threshold else 0.0)
+            else (1.0 if traded < cold_book_volume_threshold else 0.0)
         )
         if use_fill_score_ranking:
             rank = book_fill_score(
