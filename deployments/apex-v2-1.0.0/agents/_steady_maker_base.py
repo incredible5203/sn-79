@@ -33,32 +33,32 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
         "min_spread_ticks": 6.0,
         "min_rt_edge_ticks": 5.0,
         "max_spread_ratio": 0.0010,
+        "inventory_skew_soft": 0.005,
+        "inventory_skew_hard": 0.012,
+    },
+    "pulse": {
+        "max_books_per_tick": 3,
+        "max_total_instructions": 8,
+        "max_instructions_per_book": 2,
+        "book_rotation_groups": 22,
+        "cadence_interval_ns": 32_000_000_000,
+        "min_spread_ticks": 6.0,
+        "min_rt_edge_ticks": 5.0,
+        "max_spread_ratio": 0.0010,
         "inventory_skew_soft": 0.006,
         "inventory_skew_hard": 0.014,
     },
-    "pulse": {
-        "max_books_per_tick": 4,
-        "max_total_instructions": 10,
-        "max_instructions_per_book": 2,
-        "book_rotation_groups": 20,
-        "cadence_interval_ns": 30_000_000_000,
-        "min_spread_ticks": 5.0,
-        "min_rt_edge_ticks": 4.0,
-        "max_spread_ratio": 0.0010,
-        "inventory_skew_soft": 0.008,
-        "inventory_skew_hard": 0.018,
-    },
     "forge": {
-        "max_books_per_tick": 5,
-        "max_total_instructions": 12,
+        "max_books_per_tick": 3,
+        "max_total_instructions": 8,
         "max_instructions_per_book": 2,
-        "book_rotation_groups": 16,
-        "cadence_interval_ns": 28_000_000_000,
-        "min_spread_ticks": 5.0,
-        "min_rt_edge_ticks": 4.0,
-        "max_spread_ratio": 0.0011,
-        "inventory_skew_soft": 0.008,
-        "inventory_skew_hard": 0.018,
+        "book_rotation_groups": 26,
+        "cadence_interval_ns": 36_000_000_000,
+        "min_spread_ticks": 6.0,
+        "min_rt_edge_ticks": 5.0,
+        "max_spread_ratio": 0.0010,
+        "inventory_skew_soft": 0.005,
+        "inventory_skew_hard": 0.012,
     },
 }
 
@@ -80,9 +80,9 @@ class SteadyMakerAgent(FinanceSimulationAgent):
         self.steady_profile = profile
         defaults = _PROFILE_DEFAULTS.get(profile, _PROFILE_DEFAULTS["pulse"])
 
-        self.min_quantity = float(getattr(self.config, "min_quantity", 0.30))
+        self.min_quantity = float(getattr(self.config, "min_quantity", 0.32))
         self.max_quantity = float(
-            getattr(self.config, "max_quantity", defaults.get("max_quantity", 0.30))
+            getattr(self.config, "max_quantity", defaults.get("max_quantity", 0.32))
         )
         self.quantity_scale = float(
             getattr(self.config, "quantity_scale", defaults.get("quantity_scale", 1.0))
@@ -160,7 +160,7 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             )
         )
         self.max_tape_imbalance = float(
-            getattr(self.config, "max_tape_imbalance", 0.35)
+            getattr(self.config, "max_tape_imbalance", 0.30)
         )
 
         self.cancel_all_on_startup = param_bool(

@@ -49,9 +49,9 @@ def sim_order_qty(
     quantity_scale: float,
     volume_decimals: int,
     *,
-    sim_min: float = 0.30,
+    sim_min: float = 0.32,
 ) -> float:
-    """Round-trip safe order size (sim minimum is typically 0.25–0.30 BASE)."""
+    """Round-trip safe order size (finney min is 0.31 BASE after wire rounding)."""
     step = 10 ** (-volume_decimals)
     raw = max(min_quantity, max_quantity * quantity_scale, sim_min)
     qty = math.ceil((raw - 1e-12) / step) * step
@@ -103,7 +103,12 @@ def place_limit(
     qty: float,
     price: float,
     expiry_period: int,
+    *,
+    volume_decimals: int | None = None,
+    min_quantity: float = 0.32,
 ) -> None:
+    if volume_decimals is not None:
+        qty = sim_order_qty(min_quantity, qty, 1.0, volume_decimals)
     response.limit_order(
         book_id,
         direction,
@@ -137,9 +142,7 @@ def repay_loans_fifo(
         return False
     book_id = indebted[rotate_key % len(indebted)]
     order_id = min(accounts[book_id].loans.keys())
-    qty = clamp_qty(min_quantity, vdec)
-    if qty < min_quantity:
-        return False
+    qty = sim_order_qty(min_quantity, min_quantity, 1.0, vdec)
     response.close_position(book_id=book_id, order_id=order_id, quantity=qty)
     return True
 
@@ -1354,15 +1357,24 @@ def steady_maker_score_tick(
             continue
         if not budget.can_place(book_id, 1):
             continue
-        place_limit(response, book_id, trade_dir, qty, price, expiry_period)
+        place_limit(
+            response,
+            book_id,
+            trade_dir,
+            qty,
+            price,
+            expiry_period,
+            volume_decimals=vdec,
+            min_quantity=min_quantity,
+        )
         budget.mark(book_id, 1)
         placed.add(book_id)
         direction[book_id] = (
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
-    quote_candidates: list[tuple[float, int, float, float, float]] = []
-    for book_id, (_book, best_bid, best_ask, mid) in book_rows.items():
+    quote_candidates: list[tuple[float, int, Book, float, float, float]] = []
+    for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
         if book_id in placed or _has_loan(accounts, book_id):
             continue
         if (book_id % book_rotation_groups) != rot:
@@ -1371,11 +1383,11 @@ def steady_maker_score_tick(
         if abs(skew) >= inventory_skew_soft:
             continue
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-        quote_candidates.append((spread_ticks, book_id, best_bid, best_ask, mid))
+        quote_candidates.append((spread_ticks, book_id, book, best_bid, best_ask, mid))
     quote_candidates.sort(key=lambda x: -x[0])
 
     quote_count = 0
-    for _spread_ticks, book_id, best_bid, best_ask, mid in quote_candidates:
+    for _spread_ticks, book_id, book, best_bid, best_ask, mid in quote_candidates:
         if quote_count >= max_books_per_tick or budget.total >= max_total_instructions:
             break
         if book_id in placed:
@@ -1386,9 +1398,23 @@ def steady_maker_score_tick(
         elif skew < -0.002:
             trade_dir = OrderDirection.BUY
         else:
-            trade_dir = (
-                OrderDirection.BUY if (book_id + rot) % 2 == 0 else OrderDirection.SELL
-            )
+            mp = microprice(book)
+            if mp is not None and tick > 0:
+                edge_ticks = (mp - mid) / tick
+                if edge_ticks > 0.75:
+                    trade_dir = OrderDirection.BUY
+                elif edge_ticks < -0.75:
+                    trade_dir = OrderDirection.SELL
+                else:
+                    trade_dir = (
+                        OrderDirection.BUY
+                        if (book_id + rot) % 2 == 0
+                        else OrderDirection.SELL
+                    )
+            else:
+                trade_dir = (
+                    OrderDirection.BUY if (book_id + rot) % 2 == 0 else OrderDirection.SELL
+                )
         price = _limit_price(trade_dir, best_bid, best_ask, tick, pdec, mode="inside")
         account = accounts[book_id]
         if trade_dir == OrderDirection.BUY:
@@ -1398,7 +1424,16 @@ def steady_maker_score_tick(
             continue
         if not budget.can_place(book_id, 1):
             continue
-        place_limit(response, book_id, trade_dir, qty, price, expiry_period)
+        place_limit(
+            response,
+            book_id,
+            trade_dir,
+            qty,
+            price,
+            expiry_period,
+            volume_decimals=vdec,
+            min_quantity=min_quantity,
+        )
         budget.mark(book_id, 1)
         placed.add(book_id)
         quote_count += 1
