@@ -3,7 +3,7 @@
 > **Audience:** People with no prior knowledge of Bittensor, SN-79, or automated trading  
 > **Subnet:** Bittensor netuid **79** (mainnet) / **366** (testnet)  
 > **Software:** τaos package **0.4.5**  
-> **Related deep dives:** [Miner ↔ Validator Protocol](./SN-79-miner-validator-protocol.md) · [What market is this?](./SN-79-what-market-is-this.md) · [FAQ](./FAQ.md)
+> **Related deep dives:** [Extra Questions (FAQ)](./SN-79-extra-questions.md) · [Miner ↔ Validator Protocol](./SN-79-miner-validator-protocol.md) · [What market is this?](./SN-79-what-market-is-this.md) · [FAQ](./FAQ.md)
 
 ---
 
@@ -18,6 +18,8 @@
 7. [How can miners increase their score?](#7-how-can-miners-increase-their-score)
 8. [Glossary](#8-glossary)
 9. [One complete tick — worked example](#9-one-complete-tick--worked-example)
+
+**More Q&A:** [SN-79-extra-questions.md](./SN-79-extra-questions.md) — post-decompress tick workflow, cancel/buy/sell logic, why scores differ, how validators score trades, and how to raise **incentive**.
 
 ---
 

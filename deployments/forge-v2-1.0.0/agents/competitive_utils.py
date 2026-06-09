@@ -1268,8 +1268,10 @@ def steady_maker_score_tick(
     max_spread_ratio: float = 0.0010,
     min_spread_ticks: float = 7.0,
     min_rt_edge_ticks: float = 6.0,
+    min_completion_rt_edge_ticks: float | None = None,
     min_microprice_edge_ticks: float = 1.5,
     max_tape_imbalance: float = 0.28,
+    cold_book_volume_threshold: float = 500.0,
 ) -> None:
     """
     Kappa-focused maker: wide books, microprice-filtered quotes, completion legs.
@@ -1278,6 +1280,11 @@ def steady_maker_score_tick(
     after maker fills (inside only, edge vs fill price) and skipping weak quotes.
     """
     requote_hints = requote_hints or {}
+    completion_edge = (
+        min_rt_edge_ticks
+        if min_completion_rt_edge_ticks is None
+        else min_completion_rt_edge_ticks
+    )
     vdec = simulation_config.volumeDecimals
     pdec = simulation_config.priceDecimals
     ts = state.timestamp
@@ -1351,7 +1358,7 @@ def steady_maker_score_tick(
         comp_edge = _completion_rt_edge_ticks(
             fill_price, comp_dir, best_bid, best_ask, tick, pdec
         )
-        if comp_edge < min_rt_edge_ticks:
+        if comp_edge < completion_edge:
             continue
         requote_jobs.append((comp_edge + 50.0, book_id, best_bid, best_ask, mid, comp_dir))
     requote_jobs.sort(key=lambda x: -x[0])
@@ -1438,7 +1445,15 @@ def steady_maker_score_tick(
         if abs(skew) >= inventory_skew_soft:
             continue
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-        quote_candidates.append((spread_ticks, book_id, book, best_bid, best_ask, mid))
+        traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
+        cold_bonus = (
+            4.0
+            if traded < cold_book_volume_threshold * 0.1
+            else (2.0 if traded < cold_book_volume_threshold else 0.0)
+        )
+        quote_candidates.append(
+            (spread_ticks + cold_bonus, book_id, book, best_bid, best_ask, mid)
+        )
     quote_candidates.sort(key=lambda x: -x[0])
 
     quote_count = 0

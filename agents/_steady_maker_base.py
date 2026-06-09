@@ -26,46 +26,52 @@ from taos.im.protocol.instructions import OrderDirection
 
 _PROFILE_DEFAULTS: dict[str, dict] = {
     "apex": {
-        "max_books_per_tick": 2,
-        "max_total_instructions": 6,
+        "max_books_per_tick": 3,
+        "max_total_instructions": 8,
         "max_instructions_per_book": 2,
-        "max_requote_per_tick": 2,
-        "book_rotation_groups": 28,
-        "cadence_interval_ns": 38_000_000_000,
+        "max_requote_per_tick": 3,
+        "book_rotation_groups": 22,
+        "cadence_interval_ns": 32_000_000_000,
         "min_spread_ticks": 7.0,
         "min_rt_edge_ticks": 6.0,
+        "min_completion_rt_edge_ticks": 7.0,
         "min_microprice_edge_ticks": 1.5,
         "max_spread_ratio": 0.0009,
         "inventory_skew_soft": 0.004,
         "inventory_skew_hard": 0.010,
+        "cold_book_volume_threshold": 500.0,
     },
     "pulse": {
-        "max_books_per_tick": 2,
-        "max_total_instructions": 6,
+        "max_books_per_tick": 3,
+        "max_total_instructions": 8,
         "max_instructions_per_book": 2,
-        "max_requote_per_tick": 2,
-        "book_rotation_groups": 24,
-        "cadence_interval_ns": 35_000_000_000,
+        "max_requote_per_tick": 3,
+        "book_rotation_groups": 20,
+        "cadence_interval_ns": 30_000_000_000,
         "min_spread_ticks": 7.0,
         "min_rt_edge_ticks": 6.0,
+        "min_completion_rt_edge_ticks": 7.0,
         "min_microprice_edge_ticks": 1.5,
         "max_spread_ratio": 0.0009,
         "inventory_skew_soft": 0.005,
         "inventory_skew_hard": 0.012,
+        "cold_book_volume_threshold": 500.0,
     },
     "forge": {
-        "max_books_per_tick": 2,
-        "max_total_instructions": 6,
+        "max_books_per_tick": 3,
+        "max_total_instructions": 8,
         "max_instructions_per_book": 2,
-        "max_requote_per_tick": 2,
-        "book_rotation_groups": 30,
-        "cadence_interval_ns": 40_000_000_000,
-        "min_spread_ticks": 8.0,
+        "max_requote_per_tick": 3,
+        "book_rotation_groups": 24,
+        "cadence_interval_ns": 34_000_000_000,
+        "min_spread_ticks": 7.0,
         "min_rt_edge_ticks": 6.0,
-        "min_microprice_edge_ticks": 2.0,
+        "min_completion_rt_edge_ticks": 7.0,
+        "min_microprice_edge_ticks": 1.5,
         "max_spread_ratio": 0.0009,
         "inventory_skew_soft": 0.004,
         "inventory_skew_hard": 0.010,
+        "cold_book_volume_threshold": 500.0,
     },
 }
 
@@ -122,6 +128,20 @@ class SteadyMakerAgent(FinanceSimulationAgent):
                 self.config,
                 "min_rt_edge_ticks",
                 defaults.get("min_rt_edge_ticks", 5.0),
+            )
+        )
+        self.min_completion_rt_edge_ticks = float(
+            getattr(
+                self.config,
+                "min_completion_rt_edge_ticks",
+                defaults.get("min_completion_rt_edge_ticks", self.min_rt_edge_ticks),
+            )
+        )
+        self.cold_book_volume_threshold = float(
+            getattr(
+                self.config,
+                "cold_book_volume_threshold",
+                defaults.get("cold_book_volume_threshold", 500.0),
             )
         )
         self.max_books_per_tick = int(
@@ -202,6 +222,8 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             f"books/tick={self.max_books_per_tick} "
             f"instr_cap={self.max_total_instructions} "
             f"min_spread_ticks={self.min_spread_ticks} "
+            f"min_rt_edge={self.min_rt_edge_ticks} "
+            f"min_comp_edge={self.min_completion_rt_edge_ticks} "
             f"min_mp_edge={self.min_microprice_edge_ticks} "
             f"requote={self.max_requote_per_tick} "
             f"cancel_all_on_startup={self.cancel_all_on_startup}"
@@ -287,8 +309,10 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             max_spread_ratio=self.max_spread_ratio,
             min_spread_ticks=self.min_spread_ticks,
             min_rt_edge_ticks=self.min_rt_edge_ticks,
+            min_completion_rt_edge_ticks=self.min_completion_rt_edge_ticks,
             min_microprice_edge_ticks=self.min_microprice_edge_ticks,
             max_requote_per_tick=self.max_requote_per_tick,
             max_tape_imbalance=self.max_tape_imbalance,
+            cold_book_volume_threshold=self.cold_book_volume_threshold,
         )
         return response
