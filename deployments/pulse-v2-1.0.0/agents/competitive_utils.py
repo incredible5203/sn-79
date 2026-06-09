@@ -1722,11 +1722,11 @@ def ascend_score_tick(
         fs = book_fill_score(
             _book, accounts, book_id, spread_ticks=spread_ticks, requote=True
         )
-        requote_jobs.append((comp_edge + fs * 0.1 + 100.0, book_id, best_bid, best_ask, mid, comp_dir))
+        requote_jobs.append((comp_edge + fs * 0.15 + 150.0, book_id, best_bid, best_ask, mid, comp_dir))
     requote_jobs.sort(key=lambda x: -x[0])
     requote_count = 0
     for _prio, book_id, best_bid, best_ask, _mid, trade_dir in requote_jobs:
-        if requote_count >= max_requote_per_tick or len(placed) >= max_books_per_tick:
+        if requote_count >= max_requote_per_tick or len(placed) >= max_books_per_tick + 1:
             break
         if book_id in placed:
             continue
@@ -1796,6 +1796,12 @@ def ascend_score_tick(
     if risk_off:
         return
 
+    pending_completions = len(requote_hints)
+    quote_book_cap = max(
+        1,
+        max_books_per_tick - min(pending_completions, max_books_per_tick - 1),
+    )
+
     quote_candidates: list[tuple[float, int, Book, float, float, float]] = []
     for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
         if book_id in placed or _has_loan(accounts, book_id):
@@ -1830,7 +1836,7 @@ def ascend_score_tick(
 
     quote_count = 0
     for _rank, book_id, book, best_bid, best_ask, mid in quote_candidates:
-        if quote_count >= max_books_per_tick or budget.total >= max_total_instructions:
+        if quote_count >= quote_book_cap or budget.total >= max_total_instructions:
             break
         if book_id in placed:
             continue
@@ -1839,9 +1845,9 @@ def ascend_score_tick(
         if mp is None or tick <= 0:
             continue
         edge_ticks = (mp - mid) / tick
-        if skew > 0.0025:
+        if skew > 0.002:
             trade_dir = OrderDirection.SELL
-        elif skew < -0.0025:
+        elif skew < -0.002:
             trade_dir = OrderDirection.BUY
         elif edge_ticks >= min_microprice_edge_ticks:
             trade_dir = OrderDirection.BUY
