@@ -1251,6 +1251,7 @@ def steady_maker_score_tick(
     *,
     last_mid: dict[int, float],
     mids_scratch: dict[int, float],
+    requote_hints: dict[int, tuple[OrderDirection, float]] | None = None,
     min_quantity: float,
     max_quantity: float,
     max_fee_rate: float,
@@ -1258,22 +1259,25 @@ def steady_maker_score_tick(
     expiry_period: int,
     inventory_skew_soft: float = 0.008,
     inventory_skew_hard: float = 0.018,
-    max_books_per_tick: int = 4,
+    max_books_per_tick: int = 2,
     max_instructions_per_book: int = 2,
-    max_total_instructions: int = 10,
+    max_total_instructions: int = 6,
+    max_requote_per_tick: int = 2,
     book_rotation_groups: int = 20,
     cadence_interval_ns: int = 30_000_000_000,
     max_spread_ratio: float = 0.0010,
-    min_spread_ticks: float = 6.0,
-    min_rt_edge_ticks: float = 5.0,
-    max_tape_imbalance: float = 0.35,
+    min_spread_ticks: float = 7.0,
+    min_rt_edge_ticks: float = 6.0,
+    min_microprice_edge_ticks: float = 1.5,
+    max_tape_imbalance: float = 0.28,
 ) -> None:
     """
-    Non-Turbo conservative maker: wide spreads only, single-sided inside quotes.
+    Kappa-focused maker: wide books, microprice-filtered quotes, completion legs.
 
-    Designed to stop the Turbo/power bleed pattern (high RT volume, negative
-    realized, kappa None). No requote, no two-sided, no market orders.
+    Targets positive median Kappa-3 and realized PnL by completing round trips
+    after maker fills (inside only, edge vs fill price) and skipping weak quotes.
     """
+    requote_hints = requote_hints or {}
     vdec = simulation_config.volumeDecimals
     pdec = simulation_config.priceDecimals
     ts = state.timestamp
@@ -1330,6 +1334,57 @@ def steady_maker_score_tick(
             tick,
             budget,
             max_cancel=max_instructions_per_book,
+        )
+
+    # Phase 0 — complete round trips after maker fills (inside only, edge vs fill)
+    requote_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
+    for book_id, (comp_dir, fill_price) in requote_hints.items():
+        row = book_rows.get(book_id)
+        if row is None or _has_loan(accounts, book_id):
+            continue
+        _book, best_bid, best_ask, mid = row
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < min_spread_ticks:
+            continue
+        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
+            continue
+        comp_edge = _completion_rt_edge_ticks(
+            fill_price, comp_dir, best_bid, best_ask, tick, pdec
+        )
+        if comp_edge < min_rt_edge_ticks:
+            continue
+        requote_jobs.append((comp_edge + 50.0, book_id, best_bid, best_ask, mid, comp_dir))
+    requote_jobs.sort(key=lambda x: -x[0])
+    requote_count = 0
+    for _prio, book_id, best_bid, best_ask, _mid, trade_dir in requote_jobs:
+        if requote_count >= max_requote_per_tick or len(placed) >= max_books_per_tick:
+            break
+        if book_id in placed:
+            continue
+        price = _limit_price(trade_dir, best_bid, best_ask, tick, pdec, mode="inside")
+        account = accounts[book_id]
+        if trade_dir == OrderDirection.BUY:
+            if price >= best_ask or account.quote_balance.free < qty * price:
+                continue
+        elif price <= best_bid or account.base_balance.free < qty:
+            continue
+        if not budget.can_place(book_id, 1):
+            continue
+        place_limit(
+            response,
+            book_id,
+            trade_dir,
+            qty,
+            price,
+            expiry_period,
+            volume_decimals=vdec,
+            min_quantity=min_quantity,
+        )
+        budget.mark(book_id, 1)
+        placed.add(book_id)
+        requote_count += 1
+        direction[book_id] = (
+            OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
     flatten_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
@@ -1393,28 +1448,20 @@ def steady_maker_score_tick(
         if book_id in placed:
             continue
         skew = inventory_skew(accounts, book_id, mid)
-        if skew > 0.002:
+        mp = microprice(book)
+        if mp is None or tick <= 0:
+            continue
+        edge_ticks = (mp - mid) / tick
+        if skew > 0.004:
             trade_dir = OrderDirection.SELL
-        elif skew < -0.002:
+        elif skew < -0.004:
             trade_dir = OrderDirection.BUY
+        elif edge_ticks >= min_microprice_edge_ticks:
+            trade_dir = OrderDirection.BUY
+        elif edge_ticks <= -min_microprice_edge_ticks:
+            trade_dir = OrderDirection.SELL
         else:
-            mp = microprice(book)
-            if mp is not None and tick > 0:
-                edge_ticks = (mp - mid) / tick
-                if edge_ticks > 0.75:
-                    trade_dir = OrderDirection.BUY
-                elif edge_ticks < -0.75:
-                    trade_dir = OrderDirection.SELL
-                else:
-                    trade_dir = (
-                        OrderDirection.BUY
-                        if (book_id + rot) % 2 == 0
-                        else OrderDirection.SELL
-                    )
-            else:
-                trade_dir = (
-                    OrderDirection.BUY if (book_id + rot) % 2 == 0 else OrderDirection.SELL
-                )
+            continue
         price = _limit_price(trade_dir, best_bid, best_ask, tick, pdec, mode="inside")
         account = accounts[book_id]
         if trade_dir == OrderDirection.BUY:

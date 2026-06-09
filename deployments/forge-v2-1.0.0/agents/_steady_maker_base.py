@@ -21,44 +21,51 @@ from competitive_utils import (
 )
 from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
+from taos.im.protocol.events import TradeEvent
 from taos.im.protocol.instructions import OrderDirection
 
 _PROFILE_DEFAULTS: dict[str, dict] = {
     "apex": {
-        "max_books_per_tick": 3,
-        "max_total_instructions": 8,
+        "max_books_per_tick": 2,
+        "max_total_instructions": 6,
         "max_instructions_per_book": 2,
-        "book_rotation_groups": 24,
-        "cadence_interval_ns": 35_000_000_000,
-        "min_spread_ticks": 6.0,
-        "min_rt_edge_ticks": 5.0,
-        "max_spread_ratio": 0.0010,
-        "inventory_skew_soft": 0.005,
-        "inventory_skew_hard": 0.012,
+        "max_requote_per_tick": 2,
+        "book_rotation_groups": 28,
+        "cadence_interval_ns": 38_000_000_000,
+        "min_spread_ticks": 7.0,
+        "min_rt_edge_ticks": 6.0,
+        "min_microprice_edge_ticks": 1.5,
+        "max_spread_ratio": 0.0009,
+        "inventory_skew_soft": 0.004,
+        "inventory_skew_hard": 0.010,
     },
     "pulse": {
-        "max_books_per_tick": 3,
-        "max_total_instructions": 8,
+        "max_books_per_tick": 2,
+        "max_total_instructions": 6,
         "max_instructions_per_book": 2,
-        "book_rotation_groups": 22,
-        "cadence_interval_ns": 32_000_000_000,
-        "min_spread_ticks": 6.0,
-        "min_rt_edge_ticks": 5.0,
-        "max_spread_ratio": 0.0010,
-        "inventory_skew_soft": 0.006,
-        "inventory_skew_hard": 0.014,
-    },
-    "forge": {
-        "max_books_per_tick": 3,
-        "max_total_instructions": 8,
-        "max_instructions_per_book": 2,
-        "book_rotation_groups": 26,
-        "cadence_interval_ns": 36_000_000_000,
-        "min_spread_ticks": 6.0,
-        "min_rt_edge_ticks": 5.0,
-        "max_spread_ratio": 0.0010,
+        "max_requote_per_tick": 2,
+        "book_rotation_groups": 24,
+        "cadence_interval_ns": 35_000_000_000,
+        "min_spread_ticks": 7.0,
+        "min_rt_edge_ticks": 6.0,
+        "min_microprice_edge_ticks": 1.5,
+        "max_spread_ratio": 0.0009,
         "inventory_skew_soft": 0.005,
         "inventory_skew_hard": 0.012,
+    },
+    "forge": {
+        "max_books_per_tick": 2,
+        "max_total_instructions": 6,
+        "max_instructions_per_book": 2,
+        "max_requote_per_tick": 2,
+        "book_rotation_groups": 30,
+        "cadence_interval_ns": 40_000_000_000,
+        "min_spread_ticks": 8.0,
+        "min_rt_edge_ticks": 6.0,
+        "min_microprice_edge_ticks": 2.0,
+        "max_spread_ratio": 0.0009,
+        "inventory_skew_soft": 0.004,
+        "inventory_skew_hard": 0.010,
     },
 }
 
@@ -160,8 +167,23 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             )
         )
         self.max_tape_imbalance = float(
-            getattr(self.config, "max_tape_imbalance", 0.30)
+            getattr(self.config, "max_tape_imbalance", 0.28)
         )
+        self.max_requote_per_tick = int(
+            getattr(
+                self.config,
+                "max_requote_per_tick",
+                defaults.get("max_requote_per_tick", 2),
+            )
+        )
+        self.min_microprice_edge_ticks = float(
+            getattr(
+                self.config,
+                "min_microprice_edge_ticks",
+                defaults.get("min_microprice_edge_ticks", 1.5),
+            )
+        )
+        self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 8))
 
         self.cancel_all_on_startup = param_bool(
             getattr(self.config, "cancel_all_on_startup", True),
@@ -172,6 +194,7 @@ class SteadyMakerAgent(FinanceSimulationAgent):
         self.direction: dict[int, OrderDirection] = {}
         self._last_mid: dict[int, float] = {}
         self._mids_scratch: dict[int, float] = {}
+        self._requote: dict[int, tuple[OrderDirection, int, float]] = {}
 
         bt.logging.info(
             f"{self.agent_label} | steady_profile={self.steady_profile} "
@@ -179,8 +202,39 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             f"books/tick={self.max_books_per_tick} "
             f"instr_cap={self.max_total_instructions} "
             f"min_spread_ticks={self.min_spread_ticks} "
+            f"min_mp_edge={self.min_microprice_edge_ticks} "
+            f"requote={self.max_requote_per_tick} "
             f"cancel_all_on_startup={self.cancel_all_on_startup}"
         )
+
+    def _completion_side(self, event: TradeEvent) -> OrderDirection:
+        return OrderDirection.BUY if event.side == 0 else OrderDirection.SELL
+
+    def onTrade(self, event: TradeEvent, validator: str = None) -> None:
+        if event.makerAgentId != self.uid or event.bookId is None:
+            return
+        self._requote[event.bookId] = (
+            self._completion_side(event),
+            0,
+            float(event.price),
+        )
+
+    def _decay_requote(self) -> None:
+        expired: list[int] = []
+        for book_id, (side, age, fill_price) in self._requote.items():
+            age += 1
+            if age > self.requote_ttl_ticks:
+                expired.append(book_id)
+            else:
+                self._requote[book_id] = (side, age, fill_price)
+        for book_id in expired:
+            del self._requote[book_id]
+
+    def _requote_hints(self) -> dict[int, tuple[OrderDirection, float]]:
+        return {
+            book_id: (side, fill_price)
+            for book_id, (side, _age, fill_price) in self._requote.items()
+        }
 
     def _run_startup_cancel_all(self, response: FinanceAgentResponse) -> bool:
         if not self._startup_cancel_active:
@@ -208,6 +262,7 @@ class SteadyMakerAgent(FinanceSimulationAgent):
         response = FinanceAgentResponse(agent_id=self.uid)
         if self._run_startup_cancel_all(response):
             return response
+        self._decay_requote()
         steady_maker_score_tick(
             response,
             state,
@@ -216,6 +271,7 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             self.direction,
             last_mid=self._last_mid,
             mids_scratch=self._mids_scratch,
+            requote_hints=self._requote_hints(),
             min_quantity=self.min_quantity,
             max_quantity=self.max_quantity,
             max_fee_rate=self.max_fee_rate,
@@ -231,6 +287,8 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             max_spread_ratio=self.max_spread_ratio,
             min_spread_ticks=self.min_spread_ticks,
             min_rt_edge_ticks=self.min_rt_edge_ticks,
+            min_microprice_edge_ticks=self.min_microprice_edge_ticks,
+            max_requote_per_tick=self.max_requote_per_tick,
             max_tape_imbalance=self.max_tape_imbalance,
         )
         return response
