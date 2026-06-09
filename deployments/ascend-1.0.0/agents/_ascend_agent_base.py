@@ -26,23 +26,24 @@ from taos.im.protocol.instructions import OrderDirection
 
 _PROFILE_DEFAULTS: dict[str, dict] = {
     "prime": {
-        "max_books_per_tick": 4,
-        "max_total_instructions": 12,
+        "max_books_per_tick": 5,
+        "max_total_instructions": 14,
         "max_instructions_per_book": 3,
-        "max_requote_per_tick": 4,
-        "book_rotation_groups": 32,
-        "cadence_interval_ns": 28_000_000_000,
-        "rotation_windows": 3,
+        "max_requote_per_tick": 5,
+        "book_rotation_groups": 24,
+        "cadence_interval_ns": 24_000_000_000,
+        "rotation_windows": 4,
         "min_spread_ticks": 7.0,
-        "min_quote_spread_ticks": 9.0,
+        "min_quote_spread_ticks": 8.5,
         "min_rt_edge_ticks": 6.5,
         "min_quote_rt_edge_ticks": 7.0,
-        "min_completion_rt_edge_ticks": 7.5,
+        "min_completion_rt_edge_ticks": 8.0,
         "min_microprice_edge_ticks": 2.0,
         "inside_depth_ticks": 1,
         "deep_spread_ticks": 11.0,
-        "inactive_book_frac": 0.25,
-        "max_spread_ratio": 0.00085,
+        "two_sided_wide_ticks": 12.0,
+        "inactive_book_frac": 0.15,
+        "max_spread_ratio": 0.0009,
         "inventory_skew_soft": 0.003,
         "inventory_skew_hard": 0.007,
         "cold_book_volume_threshold": 500.0,
@@ -51,27 +52,53 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
     },
     "surge": {
         "max_books_per_tick": 5,
-        "max_total_instructions": 14,
+        "max_total_instructions": 15,
         "max_instructions_per_book": 3,
-        "max_requote_per_tick": 5,
-        "book_rotation_groups": 32,
-        "cadence_interval_ns": 24_000_000_000,
+        "max_requote_per_tick": 6,
+        "book_rotation_groups": 24,
+        "cadence_interval_ns": 22_000_000_000,
         "rotation_windows": 4,
         "min_spread_ticks": 6.5,
         "min_quote_spread_ticks": 8.0,
         "min_rt_edge_ticks": 6.0,
         "min_quote_rt_edge_ticks": 6.5,
-        "min_completion_rt_edge_ticks": 7.0,
+        "min_completion_rt_edge_ticks": 7.5,
         "min_microprice_edge_ticks": 1.8,
         "inside_depth_ticks": 1,
         "deep_spread_ticks": 10.0,
-        "inactive_book_frac": 0.22,
+        "two_sided_wide_ticks": 11.0,
+        "inactive_book_frac": 0.12,
         "max_spread_ratio": 0.0009,
-        "inventory_skew_soft": 0.0035,
+        "inventory_skew_soft": 0.003,
         "inventory_skew_hard": 0.008,
         "cold_book_volume_threshold": 500.0,
         "max_tape_imbalance": 0.22,
-        "risk_off_skewed_books": 4,
+        "risk_off_skewed_books": 3,
+    },
+    "forge": {
+        "max_books_per_tick": 4,
+        "max_total_instructions": 13,
+        "max_instructions_per_book": 3,
+        "max_requote_per_tick": 5,
+        "book_rotation_groups": 28,
+        "cadence_interval_ns": 26_000_000_000,
+        "rotation_windows": 3,
+        "min_spread_ticks": 7.0,
+        "min_quote_spread_ticks": 9.0,
+        "min_rt_edge_ticks": 6.5,
+        "min_quote_rt_edge_ticks": 7.5,
+        "min_completion_rt_edge_ticks": 8.0,
+        "min_microprice_edge_ticks": 2.0,
+        "inside_depth_ticks": 1,
+        "deep_spread_ticks": 11.0,
+        "two_sided_wide_ticks": 12.0,
+        "inactive_book_frac": 0.18,
+        "max_spread_ratio": 0.00088,
+        "inventory_skew_soft": 0.003,
+        "inventory_skew_hard": 0.007,
+        "cold_book_volume_threshold": 500.0,
+        "max_tape_imbalance": 0.18,
+        "risk_off_skewed_books": 3,
     },
 }
 
@@ -263,6 +290,13 @@ class AscendAgent(FinanceSimulationAgent):
                 defaults.get("risk_off_skewed_books", 3),
             )
         )
+        self.two_sided_wide_ticks = float(
+            getattr(
+                self.config,
+                "two_sided_wide_ticks",
+                defaults.get("two_sided_wide_ticks", 0.0),
+            )
+        )
         self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 6))
 
         self.cancel_all_on_startup = param_bool(
@@ -285,6 +319,7 @@ class AscendAgent(FinanceSimulationAgent):
             f"min_spread={self.min_spread_ticks} "
             f"min_rt={self.min_rt_edge_ticks} "
             f"min_comp={self.min_completion_rt_edge_ticks} "
+            f"two_sided>={self.two_sided_wide_ticks} "
             f"skew_soft={self.inventory_skew_soft} "
             f"inactive_skip={self.inactive_book_frac} "
             f"cancel_all_on_startup={self.cancel_all_on_startup}"
@@ -382,5 +417,6 @@ class AscendAgent(FinanceSimulationAgent):
             deep_spread_ticks=self.deep_spread_ticks,
             inactive_book_frac=self.inactive_book_frac,
             risk_off_skewed_books=self.risk_off_skewed_books,
+            two_sided_wide_ticks=self.two_sided_wide_ticks,
         )
         return response

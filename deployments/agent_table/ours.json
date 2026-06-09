@@ -18,6 +18,12 @@
       "label": "deploy-forge-v2",
       "deployment": "forge-v2-1.0.0",
       "run_script": "run_deploy_forge_v2.sh"
+    },
+    {
+      "agent_id": "209",
+      "label": "deploy-vault-1.0.0",
+      "deployment": "ascend-1.0.0",
+      "run_script": "run_deploy_ascend.sh"
     }
   ]
 }
