@@ -558,17 +558,24 @@ def _limit_price(
     pdec: int,
     *,
     mode: str,
+    depth_ticks: int = 1,
 ) -> float:
     """
     Price modes for maker orders:
-      inside     — one tick inside the spread (default, best for PnL)
+      inside     — depth_ticks inside the spread (default depth 1)
+      deep_inside — alias for inside with depth_ticks >= 2
       join_touch — join bid (buy) or ask (sell) queue passively at touch
       cross      — emergency flatten only (buy@ask / sell@bid)
     """
-    if mode == "inside":
+    if mode in ("inside", "deep_inside"):
+        depth = max(1, depth_ticks if mode == "inside" else max(2, depth_ticks))
         if trade_dir == OrderDirection.BUY:
-            return round_price(min(best_bid + tick, best_ask - tick), pdec)
-        return round_price(max(best_ask - tick, best_bid + tick), pdec)
+            return round_price(
+                min(best_bid + depth * tick, best_ask - tick), pdec
+            )
+        return round_price(
+            max(best_ask - depth * tick, best_bid + tick), pdec
+        )
     if mode == "join_touch":
         if trade_dir == OrderDirection.BUY:
             return round_price(best_bid, pdec)
@@ -1270,8 +1277,12 @@ def steady_maker_score_tick(
     min_rt_edge_ticks: float = 6.0,
     min_completion_rt_edge_ticks: float | None = None,
     min_microprice_edge_ticks: float = 1.5,
+    min_quote_spread_ticks: float | None = None,
     max_tape_imbalance: float = 0.28,
     cold_book_volume_threshold: float = 500.0,
+    rotation_windows: int = 1,
+    inside_depth_ticks: int = 1,
+    use_fill_score_ranking: bool = False,
 ) -> None:
     """
     Kappa-focused maker: wide books, microprice-filtered quotes, completion legs.
@@ -1285,12 +1296,22 @@ def steady_maker_score_tick(
         if min_completion_rt_edge_ticks is None
         else min_completion_rt_edge_ticks
     )
+    quote_spread_min = (
+        min_spread_ticks
+        if min_quote_spread_ticks is None
+        else min_quote_spread_ticks
+    )
     vdec = simulation_config.volumeDecimals
     pdec = simulation_config.priceDecimals
     ts = state.timestamp
     tick = tick_size(pdec)
     rot = (ts // cadence_interval_ns) % max(book_rotation_groups, 1)
+    active_rots = {
+        (rot + i) % max(book_rotation_groups, 1)
+        for i in range(max(1, rotation_windows))
+    }
     budget = _InstructionBudget(max_instructions_per_book, max_total_instructions)
+    quote_depth = max(1, inside_depth_ticks)
 
     repay_loans_fifo(
         response,
@@ -1368,7 +1389,15 @@ def steady_maker_score_tick(
             break
         if book_id in placed:
             continue
-        price = _limit_price(trade_dir, best_bid, best_ask, tick, pdec, mode="inside")
+        price = _limit_price(
+            trade_dir,
+            best_bid,
+            best_ask,
+            tick,
+            pdec,
+            mode="inside",
+            depth_ticks=quote_depth,
+        )
         account = accounts[book_id]
         if trade_dir == OrderDirection.BUY:
             if price >= best_ask or account.quote_balance.free < qty * price:
@@ -1410,7 +1439,15 @@ def steady_maker_score_tick(
             break
         if book_id in placed:
             continue
-        price = _limit_price(trade_dir, best_bid, best_ask, tick, pdec, mode="inside")
+        price = _limit_price(
+            trade_dir,
+            best_bid,
+            best_ask,
+            tick,
+            pdec,
+            mode="inside",
+            depth_ticks=quote_depth,
+        )
         account = accounts[book_id]
         if trade_dir == OrderDirection.BUY:
             if price >= best_ask or account.quote_balance.free < qty * price:
@@ -1439,25 +1476,31 @@ def steady_maker_score_tick(
     for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
         if book_id in placed or _has_loan(accounts, book_id):
             continue
-        if (book_id % book_rotation_groups) != rot:
+        if (book_id % book_rotation_groups) not in active_rots:
             continue
         skew = inventory_skew(accounts, book_id, mid)
         if abs(skew) >= inventory_skew_soft:
             continue
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < quote_spread_min:
+            continue
         traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
         cold_bonus = (
-            4.0
+            6.0
             if traded < cold_book_volume_threshold * 0.1
-            else (2.0 if traded < cold_book_volume_threshold else 0.0)
+            else (3.0 if traded < cold_book_volume_threshold else 0.0)
         )
-        quote_candidates.append(
-            (spread_ticks + cold_bonus, book_id, book, best_bid, best_ask, mid)
-        )
+        if use_fill_score_ranking:
+            rank = book_fill_score(
+                book, accounts, book_id, spread_ticks=spread_ticks
+            ) + cold_bonus
+        else:
+            rank = spread_ticks + cold_bonus
+        quote_candidates.append((rank, book_id, book, best_bid, best_ask, mid))
     quote_candidates.sort(key=lambda x: -x[0])
 
     quote_count = 0
-    for _spread_ticks, book_id, book, best_bid, best_ask, mid in quote_candidates:
+    for _rank, book_id, book, best_bid, best_ask, mid in quote_candidates:
         if quote_count >= max_books_per_tick or budget.total >= max_total_instructions:
             break
         if book_id in placed:
@@ -1477,7 +1520,17 @@ def steady_maker_score_tick(
             trade_dir = OrderDirection.SELL
         else:
             continue
-        price = _limit_price(trade_dir, best_bid, best_ask, tick, pdec, mode="inside")
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        depth = quote_depth if spread_ticks >= quote_spread_min + 1 else 1
+        price = _limit_price(
+            trade_dir,
+            best_bid,
+            best_ask,
+            tick,
+            pdec,
+            mode="inside",
+            depth_ticks=depth,
+        )
         account = accounts[book_id]
         if trade_dir == OrderDirection.BUY:
             if price >= best_ask or account.quote_balance.free < qty * price:

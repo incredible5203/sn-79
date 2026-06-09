@@ -26,49 +26,61 @@ from taos.im.protocol.instructions import OrderDirection
 
 _PROFILE_DEFAULTS: dict[str, dict] = {
     "apex": {
-        "max_books_per_tick": 3,
-        "max_total_instructions": 8,
-        "max_instructions_per_book": 2,
-        "max_requote_per_tick": 3,
-        "book_rotation_groups": 22,
-        "cadence_interval_ns": 32_000_000_000,
-        "min_spread_ticks": 7.0,
-        "min_rt_edge_ticks": 6.0,
-        "min_completion_rt_edge_ticks": 7.0,
-        "min_microprice_edge_ticks": 1.5,
-        "max_spread_ratio": 0.0009,
+        "max_books_per_tick": 6,
+        "max_total_instructions": 22,
+        "max_instructions_per_book": 4,
+        "max_requote_per_tick": 5,
+        "book_rotation_groups": 12,
+        "cadence_interval_ns": 22_000_000_000,
+        "rotation_windows": 3,
+        "min_spread_ticks": 8.0,
+        "min_quote_spread_ticks": 9.0,
+        "min_rt_edge_ticks": 7.0,
+        "min_completion_rt_edge_ticks": 8.0,
+        "min_microprice_edge_ticks": 2.0,
+        "inside_depth_ticks": 2,
+        "use_fill_score_ranking": True,
+        "max_spread_ratio": 0.0010,
         "inventory_skew_soft": 0.004,
         "inventory_skew_hard": 0.010,
         "cold_book_volume_threshold": 500.0,
     },
     "pulse": {
-        "max_books_per_tick": 3,
-        "max_total_instructions": 8,
-        "max_instructions_per_book": 2,
-        "max_requote_per_tick": 3,
-        "book_rotation_groups": 20,
-        "cadence_interval_ns": 30_000_000_000,
-        "min_spread_ticks": 7.0,
-        "min_rt_edge_ticks": 6.0,
-        "min_completion_rt_edge_ticks": 7.0,
-        "min_microprice_edge_ticks": 1.5,
-        "max_spread_ratio": 0.0009,
+        "max_books_per_tick": 6,
+        "max_total_instructions": 22,
+        "max_instructions_per_book": 4,
+        "max_requote_per_tick": 5,
+        "book_rotation_groups": 12,
+        "cadence_interval_ns": 20_000_000_000,
+        "rotation_windows": 3,
+        "min_spread_ticks": 8.0,
+        "min_quote_spread_ticks": 9.0,
+        "min_rt_edge_ticks": 7.0,
+        "min_completion_rt_edge_ticks": 8.0,
+        "min_microprice_edge_ticks": 2.0,
+        "inside_depth_ticks": 2,
+        "use_fill_score_ranking": True,
+        "max_spread_ratio": 0.0010,
         "inventory_skew_soft": 0.005,
         "inventory_skew_hard": 0.012,
         "cold_book_volume_threshold": 500.0,
     },
     "forge": {
-        "max_books_per_tick": 3,
-        "max_total_instructions": 8,
-        "max_instructions_per_book": 2,
-        "max_requote_per_tick": 3,
-        "book_rotation_groups": 24,
-        "cadence_interval_ns": 34_000_000_000,
-        "min_spread_ticks": 7.0,
-        "min_rt_edge_ticks": 6.0,
-        "min_completion_rt_edge_ticks": 7.0,
-        "min_microprice_edge_ticks": 1.5,
-        "max_spread_ratio": 0.0009,
+        "max_books_per_tick": 5,
+        "max_total_instructions": 20,
+        "max_instructions_per_book": 4,
+        "max_requote_per_tick": 4,
+        "book_rotation_groups": 14,
+        "cadence_interval_ns": 24_000_000_000,
+        "rotation_windows": 3,
+        "min_spread_ticks": 8.0,
+        "min_quote_spread_ticks": 10.0,
+        "min_rt_edge_ticks": 7.0,
+        "min_completion_rt_edge_ticks": 8.0,
+        "min_microprice_edge_ticks": 2.0,
+        "inside_depth_ticks": 2,
+        "use_fill_score_ranking": True,
+        "max_spread_ratio": 0.0010,
         "inventory_skew_soft": 0.004,
         "inventory_skew_hard": 0.010,
         "cold_book_volume_threshold": 500.0,
@@ -203,11 +215,43 @@ class SteadyMakerAgent(FinanceSimulationAgent):
                 defaults.get("min_microprice_edge_ticks", 1.5),
             )
         )
+        self.min_quote_spread_ticks = float(
+            getattr(
+                self.config,
+                "min_quote_spread_ticks",
+                defaults.get(
+                    "min_quote_spread_ticks",
+                    defaults.get("min_spread_ticks", 7.0),
+                ),
+            )
+        )
+        self.rotation_windows = int(
+            getattr(
+                self.config,
+                "rotation_windows",
+                defaults.get("rotation_windows", 1),
+            )
+        )
+        self.inside_depth_ticks = int(
+            getattr(
+                self.config,
+                "inside_depth_ticks",
+                defaults.get("inside_depth_ticks", 1),
+            )
+        )
+        self.use_fill_score_ranking = param_bool(
+            getattr(
+                self.config,
+                "use_fill_score_ranking",
+                defaults.get("use_fill_score_ranking", False),
+            ),
+            bool(defaults.get("use_fill_score_ranking", False)),
+        )
         self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 8))
 
         self.cancel_all_on_startup = param_bool(
-            getattr(self.config, "cancel_all_on_startup", True),
-            True,
+            getattr(self.config, "cancel_all_on_startup", False),
+            False,
         )
         self._startup_cancel_active = self.cancel_all_on_startup
 
@@ -224,8 +268,11 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             f"min_spread_ticks={self.min_spread_ticks} "
             f"min_rt_edge={self.min_rt_edge_ticks} "
             f"min_comp_edge={self.min_completion_rt_edge_ticks} "
+            f"min_quote_spread={self.min_quote_spread_ticks} "
             f"min_mp_edge={self.min_microprice_edge_ticks} "
+            f"depth={self.inside_depth_ticks} rot_win={self.rotation_windows} "
             f"requote={self.max_requote_per_tick} "
+            f"fill_score={self.use_fill_score_ranking} "
             f"cancel_all_on_startup={self.cancel_all_on_startup}"
         )
 
@@ -310,9 +357,13 @@ class SteadyMakerAgent(FinanceSimulationAgent):
             min_spread_ticks=self.min_spread_ticks,
             min_rt_edge_ticks=self.min_rt_edge_ticks,
             min_completion_rt_edge_ticks=self.min_completion_rt_edge_ticks,
+            min_quote_spread_ticks=self.min_quote_spread_ticks,
             min_microprice_edge_ticks=self.min_microprice_edge_ticks,
             max_requote_per_tick=self.max_requote_per_tick,
             max_tape_imbalance=self.max_tape_imbalance,
             cold_book_volume_threshold=self.cold_book_volume_threshold,
+            rotation_windows=self.rotation_windows,
+            inside_depth_ticks=self.inside_depth_ticks,
+            use_fill_score_ranking=self.use_fill_score_ranking,
         )
         return response
