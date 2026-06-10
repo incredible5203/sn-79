@@ -1861,56 +1861,57 @@ def ascend_score_tick(
     touch_jobs.sort(key=lambda x: -x[0])
 
     touch_count = 0
-    for _rank, book_id, book, best_bid, best_ask, mid in touch_jobs:
-        if touch_count >= max_touch_per_tick or budget.total >= max_total_instructions:
-            break
-        if book_id in placed:
-            continue
-        skew = inventory_skew(accounts, book_id, mid)
-        mp = microprice(book)
-        if skew > 0.0015:
-            trade_dir = OrderDirection.SELL
-        elif skew < -0.0015:
-            trade_dir = OrderDirection.BUY
-        elif mp is not None and tick > 0:
-            edge_ticks = (mp - mid) / tick
-            if edge_ticks >= min_microprice_edge_ticks:
-                trade_dir = OrderDirection.BUY
-            elif edge_ticks <= -min_microprice_edge_ticks:
+    if not risk_off:
+        for _rank, book_id, book, best_bid, best_ask, mid in touch_jobs:
+            if touch_count >= max_touch_per_tick or budget.total >= max_total_instructions:
+                break
+            if book_id in placed:
+                continue
+            skew = inventory_skew(accounts, book_id, mid)
+            mp = microprice(book)
+            if skew > 0.0015:
                 trade_dir = OrderDirection.SELL
+            elif skew < -0.0015:
+                trade_dir = OrderDirection.BUY
+            elif mp is not None and tick > 0:
+                edge_ticks = (mp - mid) / tick
+                if edge_ticks >= min_microprice_edge_ticks:
+                    trade_dir = OrderDirection.BUY
+                elif edge_ticks <= -min_microprice_edge_ticks:
+                    trade_dir = OrderDirection.SELL
+                else:
+                    trade_dir = (
+                        OrderDirection.BUY
+                        if (book_id + rot) % 2 == 0
+                        else OrderDirection.SELL
+                    )
             else:
                 trade_dir = (
                     OrderDirection.BUY
                     if (book_id + rot) % 2 == 0
                     else OrderDirection.SELL
                 )
-        else:
-            trade_dir = (
-                OrderDirection.BUY
-                if (book_id + rot) % 2 == 0
-                else OrderDirection.SELL
+            price = _limit_price(
+                trade_dir, best_bid, best_ask, tick, pdec, mode="join_touch"
             )
-        price = _limit_price(
-            trade_dir, best_bid, best_ask, tick, pdec, mode="join_touch"
-        )
-        account = accounts[book_id]
-        if trade_dir == OrderDirection.BUY:
-            if price >= best_ask or account.quote_balance.free < qty * price:
+            account = accounts[book_id]
+            if trade_dir == OrderDirection.BUY:
+                if price >= best_ask or account.quote_balance.free < qty * price:
+                    continue
+            elif price <= best_bid or account.base_balance.free < qty:
                 continue
-        elif price <= best_bid or account.base_balance.free < qty:
-            continue
-        if not budget.can_place(book_id, 1):
-            continue
-        place_limit(
-            response, book_id, trade_dir, qty, price, expiry_period,
-            volume_decimals=vdec, min_quantity=min_quantity,
-        )
-        budget.mark(book_id, 1)
-        placed.add(book_id)
-        touch_count += 1
-        direction[book_id] = (
-            OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
-        )
+            if not budget.can_place(book_id, 1):
+                continue
+            place_limit(
+                response, book_id, trade_dir, qty, price, expiry_period,
+                volume_decimals=vdec, min_quantity=min_quantity,
+            )
+            budget.mark(book_id, 1)
+            placed.add(book_id)
+            touch_count += 1
+            direction[book_id] = (
+                OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
+            )
 
     if risk_off:
         for book_id, (_book, best_bid, best_ask, _mid) in sorted(book_rows.items()):

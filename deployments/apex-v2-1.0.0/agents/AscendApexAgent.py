@@ -1,4 +1,4 @@
-# AscendApexAgent — high-growth maker (UID 10, prime profile)
+# AscendApexAgent — UID 10 PnL-first maker (apex profile)
 from __future__ import annotations
 
 import os
@@ -14,7 +14,7 @@ from taos.common.agents import launch
 
 class AscendApexAgent(AscendAgent):
     agent_label = "AscendApexAgent"
-    default_ascend_profile = "prime"
+    default_ascend_profile = "apex"
 
 
 if __name__ == "__main__":

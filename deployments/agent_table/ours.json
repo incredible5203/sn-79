@@ -9,7 +9,7 @@
     },
     {
       "agent_id": "10",
-      "label": "deploy-apex-v2-1.7",
+      "label": "deploy-apex-v2-1.8",
       "deployment": "apex-v2-1.0.0",
       "run_script": "run_deploy_apex_v2.sh"
     },
@@ -21,7 +21,7 @@
     },
     {
       "agent_id": "209",
-      "label": "deploy-flux-1.1.0",
+      "label": "deploy-flux-1.2.0",
       "deployment": "ascend-1.0.0",
       "run_script": "run_deploy_ascend.sh"
     }
