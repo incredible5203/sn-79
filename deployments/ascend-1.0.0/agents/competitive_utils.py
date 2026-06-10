@@ -1601,22 +1601,24 @@ def ascend_score_tick(
     inside_depth_ticks: int = 1,
     deep_spread_ticks: float = 11.0,
     inactive_book_frac: float = 0.25,
-    risk_off_skewed_books: int = 3,
+    risk_off_skewed_books: int = 2,
     two_sided_wide_ticks: float = 0.0,
+    max_flatten_per_tick: int = 8,
 ) -> None:
     """
     Ascend scoring engine — fast κ growth, Penalty → 0, positive realized PnL.
 
-    Synthesizes top-miner patterns (UID 106/229: κ≈0.85, penalty=0, lean inventory)
-    with lessons from failed Turbo/SteadyMaker deploys (10/65/158).
+    Synthesizes top-miner patterns (UID 202/26/251: κ→1+, penalty=0, lean inventory)
+    with lessons from failed Turbo/SteadyMaker/Vault deploys (10/65/158/209).
 
     Rules:
       - Completion-first inside-spread legs after maker fills (edge vs fill price)
-      - Single-sided quotes only (no two-sided churn, no reversion bets)
-      - 4 books/tick + 3 rotation windows → κ observations across 128 books faster
+      - Single-sided quotes only (two-sided only on very wide spreads, near-zero skew)
+      - Dedicated flatten budget (max_flatten_per_tick) so inventory does not accumulate
       - Skip worst inactive_book_frac books by quality → consistent median, no IQR penalty
-      - Aggressive inventory flatten (top miners hold ~55 BASE, not 10k+)
+      - Aggressive inventory flatten (top miners hold lean BASE, not 10k+)
       - Microprice direction gate on wide spreads; cold-book bonus for coverage
+      - risk_off halts new quotes when multiple books are skewed
     """
     requote_hints = requote_hints or {}
     completion_edge = (
@@ -1731,6 +1733,11 @@ def ascend_score_tick(
             break
         if book_id in placed:
             continue
+        skew = inventory_skew(accounts, book_id, _mid)
+        if trade_dir == OrderDirection.BUY and skew <= -inventory_skew_soft:
+            continue
+        if trade_dir == OrderDirection.SELL and skew >= inventory_skew_soft:
+            continue
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
         depth = base_depth + 1 if spread_ticks >= deep_spread_ticks else base_depth
         price = _limit_price(
@@ -1766,8 +1773,9 @@ def ascend_score_tick(
         flatten_jobs.append((abs(skew) * 200.0, book_id, best_bid, best_ask, mid, trade_dir))
     flatten_jobs.sort(key=lambda x: -x[0])
 
+    flatten_count = 0
     for _prio, book_id, best_bid, best_ask, mid, trade_dir in flatten_jobs:
-        if budget.total >= max_total_instructions or len(placed) >= max_books_per_tick:
+        if budget.total >= max_total_instructions or flatten_count >= max_flatten_per_tick:
             break
         if book_id in placed:
             continue
@@ -1790,11 +1798,27 @@ def ascend_score_tick(
         )
         budget.mark(book_id, 1)
         placed.add(book_id)
+        flatten_count += 1
         direction[book_id] = (
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
     if risk_off:
+        for book_id, (_book, best_bid, best_ask, _mid) in sorted(book_rows.items()):
+            if budget.total >= max_total_instructions:
+                break
+            if abs(inventory_skew(accounts, book_id, _mid)) < inventory_skew_soft:
+                continue
+            cancel_stale_orders(
+                response,
+                accounts[book_id],
+                book_id,
+                best_bid,
+                best_ask,
+                tick,
+                budget,
+                max_cancel=max_instructions_per_book,
+            )
         return
 
     quote_candidates: list[tuple[float, int, Book, float, float, float]] = []

@@ -48,7 +48,7 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
         "inventory_skew_hard": 0.007,
         "cold_book_volume_threshold": 500.0,
         "max_tape_imbalance": 0.20,
-        "risk_off_skewed_books": 3,
+        "risk_off_skewed_books": 2,
     },
     "surge": {
         "max_books_per_tick": 5,
@@ -73,7 +73,7 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
         "inventory_skew_hard": 0.008,
         "cold_book_volume_threshold": 500.0,
         "max_tape_imbalance": 0.22,
-        "risk_off_skewed_books": 3,
+        "risk_off_skewed_books": 2,
     },
     "forge": {
         "max_books_per_tick": 4,
@@ -98,7 +98,7 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
         "inventory_skew_hard": 0.007,
         "cold_book_volume_threshold": 500.0,
         "max_tape_imbalance": 0.18,
-        "risk_off_skewed_books": 3,
+        "risk_off_skewed_books": 2,
     },
 }
 
@@ -418,5 +418,6 @@ class AscendAgent(FinanceSimulationAgent):
             inactive_book_frac=self.inactive_book_frac,
             risk_off_skewed_books=self.risk_off_skewed_books,
             two_sided_wide_ticks=self.two_sided_wide_ticks,
+            max_flatten_per_tick=int(getattr(self, "max_flatten_per_tick", 8)),
         )
         return response

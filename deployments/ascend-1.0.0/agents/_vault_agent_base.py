@@ -24,43 +24,85 @@ from taos.im.protocol.events import TradeEvent
 from taos.im.protocol.instructions import OrderDirection
 from vault_engine import vault_score_tick
 
+_VAULT_DEFAULTS: dict[str, float | int] = {
+    "max_books_per_tick": 5,
+    "max_total_instructions": 14,
+    "max_instructions_per_book": 3,
+    "max_requote_per_tick": 5,
+    "book_rotation_groups": 24,
+    "cadence_interval_ns": 24_000_000_000,
+    "rotation_windows": 4,
+    "min_spread_ticks": 7.0,
+    "min_quote_spread_ticks": 8.5,
+    "min_rt_edge_ticks": 6.5,
+    "min_quote_rt_edge_ticks": 7.0,
+    "min_completion_edge_ticks": 8.0,
+    "min_microprice_edge_ticks": 2.0,
+    "max_spread_ratio": 0.0009,
+    "inventory_skew_soft": 0.003,
+    "inventory_skew_hard": 0.007,
+    "inside_depth_ticks": 1,
+    "deep_spread_ticks": 11.0,
+    "inactive_book_frac": 0.15,
+    "max_tape_imbalance": 0.20,
+    "cold_book_volume_threshold": 500.0,
+    "risk_off_skewed_books": 2,
+    "two_sided_wide_ticks": 12.0,
+    "max_flatten_per_tick": 8,
+}
+
 
 class VaultAgent(FinanceSimulationAgent):
     """
-    Vault agent — always-on maker for fast incentive growth.
+    Vault agent — PnL-preserving maker for fast incentive growth.
 
     Design goals:
       - Median κ₃ → 0.8+ → 1+ with penalty exactly 0
-      - Positive, rising realized PnL
-      - High round-trip volume across all 128 books
+      - Positive, rising realized PnL (no narrow-spread churn)
+      - Profitable round-trips across 128 books via rotation + completion legs
     """
 
     agent_label: str = "VaultAgent"
 
     def initialize(self) -> None:
+        d = _VAULT_DEFAULTS
         self.min_quantity = float(getattr(self.config, "min_quantity", 0.32))
         self.max_quantity = float(getattr(self.config, "max_quantity", 0.32))
         self.quantity_scale = float(getattr(self.config, "quantity_scale", 1.0))
         self.max_fee_rate = float(getattr(self.config, "max_fee_rate", 0.001))
         self.expiry_period = int(getattr(self.config, "expiry_period", 180_000_000_000))
 
-        self.max_books_per_tick = int(getattr(self.config, "max_books_per_tick", 8))
-        self.max_total_instructions = int(getattr(self.config, "max_total_instructions", 16))
-        self.max_instructions_per_book = int(getattr(self.config, "max_instructions_per_book", 2))
-        self.max_requote_per_tick = int(getattr(self.config, "max_requote_per_tick", 6))
-        self.book_rotation_groups = int(getattr(self.config, "book_rotation_groups", 16))
-        self.cadence_interval_ns = int(getattr(self.config, "cadence_interval_ns", 20_000_000_000))
-        self.rotation_windows = int(getattr(self.config, "rotation_windows", 6))
-        self.min_spread_ticks = float(getattr(self.config, "min_spread_ticks", 2.0))
-        self.min_two_sided_ticks = float(getattr(self.config, "min_two_sided_ticks", 3.0))
-        self.min_rt_edge_ticks = float(getattr(self.config, "min_rt_edge_ticks", 2.0))
-        self.min_completion_edge_ticks = float(getattr(self.config, "min_completion_edge_ticks", 3.0))
-        self.max_spread_ratio = float(getattr(self.config, "max_spread_ratio", 0.002))
-        self.inventory_skew_soft = float(getattr(self.config, "inventory_skew_soft", 0.06))
-        self.inventory_skew_hard = float(getattr(self.config, "inventory_skew_hard", 0.12))
-        self.inside_depth_ticks = int(getattr(self.config, "inside_depth_ticks", 1))
-        self.max_tape_imbalance = float(getattr(self.config, "max_tape_imbalance", 0.35))
-        self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 8))
+        self.max_books_per_tick = int(getattr(self.config, "max_books_per_tick", d["max_books_per_tick"]))
+        self.max_total_instructions = int(getattr(self.config, "max_total_instructions", d["max_total_instructions"]))
+        self.max_instructions_per_book = int(getattr(self.config, "max_instructions_per_book", d["max_instructions_per_book"]))
+        self.max_requote_per_tick = int(getattr(self.config, "max_requote_per_tick", d["max_requote_per_tick"]))
+        self.book_rotation_groups = int(getattr(self.config, "book_rotation_groups", d["book_rotation_groups"]))
+        self.cadence_interval_ns = int(getattr(self.config, "cadence_interval_ns", d["cadence_interval_ns"]))
+        self.rotation_windows = int(getattr(self.config, "rotation_windows", d["rotation_windows"]))
+        self.min_spread_ticks = float(getattr(self.config, "min_spread_ticks", d["min_spread_ticks"]))
+        self.min_quote_spread_ticks = float(getattr(self.config, "min_quote_spread_ticks", d["min_quote_spread_ticks"]))
+        self.min_rt_edge_ticks = float(getattr(self.config, "min_rt_edge_ticks", d["min_rt_edge_ticks"]))
+        self.min_quote_rt_edge_ticks = float(getattr(self.config, "min_quote_rt_edge_ticks", d["min_quote_rt_edge_ticks"]))
+        self.min_completion_edge_ticks = float(
+            getattr(
+                self.config,
+                "min_completion_edge_ticks",
+                getattr(self.config, "min_completion_rt_edge_ticks", d["min_completion_edge_ticks"]),
+            )
+        )
+        self.min_microprice_edge_ticks = float(getattr(self.config, "min_microprice_edge_ticks", d["min_microprice_edge_ticks"]))
+        self.max_spread_ratio = float(getattr(self.config, "max_spread_ratio", d["max_spread_ratio"]))
+        self.inventory_skew_soft = float(getattr(self.config, "inventory_skew_soft", d["inventory_skew_soft"]))
+        self.inventory_skew_hard = float(getattr(self.config, "inventory_skew_hard", d["inventory_skew_hard"]))
+        self.inside_depth_ticks = int(getattr(self.config, "inside_depth_ticks", d["inside_depth_ticks"]))
+        self.deep_spread_ticks = float(getattr(self.config, "deep_spread_ticks", d["deep_spread_ticks"]))
+        self.inactive_book_frac = float(getattr(self.config, "inactive_book_frac", d["inactive_book_frac"]))
+        self.max_tape_imbalance = float(getattr(self.config, "max_tape_imbalance", d["max_tape_imbalance"]))
+        self.cold_book_volume_threshold = float(getattr(self.config, "cold_book_volume_threshold", d["cold_book_volume_threshold"]))
+        self.risk_off_skewed_books = int(getattr(self.config, "risk_off_skewed_books", d["risk_off_skewed_books"]))
+        self.two_sided_wide_ticks = float(getattr(self.config, "two_sided_wide_ticks", d["two_sided_wide_ticks"]))
+        self.max_flatten_per_tick = int(getattr(self.config, "max_flatten_per_tick", d["max_flatten_per_tick"]))
+        self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 6))
 
         self.cancel_all_on_startup = param_bool(
             getattr(self.config, "cancel_all_on_startup", True),
@@ -77,9 +119,9 @@ class VaultAgent(FinanceSimulationAgent):
             f"{self.agent_label} | qty[{self.min_quantity},{self.max_quantity}] "
             f"books/tick={self.max_books_per_tick} instr_cap={self.max_total_instructions} "
             f"rot={self.book_rotation_groups}x{self.rotation_windows} "
-            f"min_spread={self.min_spread_ticks} two_sided>={self.min_two_sided_ticks} "
-            f"min_rt={self.min_rt_edge_ticks} min_comp={self.min_completion_edge_ticks} "
-            f"skew_soft={self.inventory_skew_soft} "
+            f"min_spread={self.min_spread_ticks} min_rt={self.min_rt_edge_ticks} "
+            f"min_comp={self.min_completion_edge_ticks} two_sided>={self.two_sided_wide_ticks} "
+            f"skew_soft={self.inventory_skew_soft} flatten/tick={self.max_flatten_per_tick} "
             f"cancel_all_on_startup={self.cancel_all_on_startup}"
         )
 
@@ -161,13 +203,21 @@ class VaultAgent(FinanceSimulationAgent):
             cadence_interval_ns=self.cadence_interval_ns,
             rotation_windows=self.rotation_windows,
             min_spread_ticks=self.min_spread_ticks,
-            min_two_sided_ticks=self.min_two_sided_ticks,
+            min_quote_spread_ticks=self.min_quote_spread_ticks,
             min_rt_edge_ticks=self.min_rt_edge_ticks,
+            min_quote_rt_edge_ticks=self.min_quote_rt_edge_ticks,
             min_completion_edge_ticks=self.min_completion_edge_ticks,
+            min_microprice_edge_ticks=self.min_microprice_edge_ticks,
             max_spread_ratio=self.max_spread_ratio,
             inventory_skew_soft=self.inventory_skew_soft,
             inventory_skew_hard=self.inventory_skew_hard,
             inside_depth_ticks=self.inside_depth_ticks,
+            deep_spread_ticks=self.deep_spread_ticks,
+            inactive_book_frac=self.inactive_book_frac,
             max_tape_imbalance=self.max_tape_imbalance,
+            cold_book_volume_threshold=self.cold_book_volume_threshold,
+            risk_off_skewed_books=self.risk_off_skewed_books,
+            two_sided_wide_ticks=self.two_sided_wide_ticks,
+            max_flatten_per_tick=self.max_flatten_per_tick,
         )
         return response
