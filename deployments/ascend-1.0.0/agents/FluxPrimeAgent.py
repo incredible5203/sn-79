@@ -13,10 +13,10 @@ from taos.common.agents import launch
 
 
 class FluxPrimeAgent(AscendAgent):
-    """UID 209 — stop bleed, strict completion, heavy flatten (recover profile)."""
+    """UID 209 — fast κ growth via flux profile (cold-book sweep + touch-join)."""
 
     agent_label = "FluxPrimeAgent"
-    default_ascend_profile = "recover"
+    default_ascend_profile = "flux"
 
 
 if __name__ == "__main__":

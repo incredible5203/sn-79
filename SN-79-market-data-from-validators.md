@@ -3,7 +3,7 @@
 > **Scope:** Trading miners on netuid **79** (mainnet) / **366** (testnet)  
 > **Package:** τaos **0.4.5**  
 > **Primary type:** `MarketSimulationStateUpdate` (validator → miner)  
-> **Related docs:** [SN-79-miner-validator-protocol.md](./SN-79-miner-validator-protocol.md), [SN-79-what-market-is-this.md](./SN-79-what-market-is-this.md)  
+> **Related docs:** [SN-79-miner-validator-protocol.md](./SN-79-miner-validator-protocol.md), [SN-79-validator-and-simulator-internals.md](./SN-79-validator-and-simulator-internals.md), [SN-79-order-types-and-config-reference.md](./SN-79-order-types-and-config-reference.md), [SN-79-what-market-is-this.md](./SN-79-what-market-is-this.md)  
 > **Sources:** `taos/im/protocol`, `taos/im/validator/query.py`, `taos/im/utils/compress.py`, `simulate/trading/.../ValidatorRequest.hpp`
 
 ---

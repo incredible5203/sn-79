@@ -3,7 +3,7 @@
 > **Audience:** Readers of [SN-79-explainer-for-beginners.md](./SN-79-explainer-for-beginners.md) who want a concrete walkthrough  
 > **Example agent:** `TurboPulseV2Agent` with `turbo_profile=recover` (UID 65, mainnet)  
 > **Protocol:** `MarketSimulationStateUpdate` → `FinanceAgentResponse`  
-> **Related:** [Miner ↔ Validator Protocol](./SN-79-miner-validator-protocol.md)
+> **Related:** [Miner ↔ Validator Protocol](./SN-79-miner-validator-protocol.md) · [Order types & config reference](./SN-79-order-types-and-config-reference.md)
 
 ---
 

@@ -1,17 +1,16 @@
-release_id=flux-1.0.0
+release_id=flux-1.4.0
 agent=FluxPrimeAgent
 profile=flux
 git_commit=local
-bundled_at=2026-06-10T08:00:00Z
-notes=Replace VaultPrimeAgent — custom vault_engine bled PnL; flux uses proven ascend_score_tick
+bundled_at=2026-06-10T16:00:00Z
+notes=Fast growth tune — rocket profile for UIDs 10/65, flux for UID 209
 design:
-  - ascend_score_tick engine (same as improving UIDs 10/65/158)
-  - flux profile: surge throughput + forge completion edge (6.5 ticks)
-  - touch-join at 4+ ticks only (not 3.5 — less adverse selection)
-  - tight inventory: 0.2% soft / 0.4% hard with cross flatten
-  - 11 books/tick, 28 instructions, 12x8 rotation
-  - cancel_all_on_startup clears bad resting orders from prior vault deploy
-targets: match UID 10/65 trajectory (κ→0+, rising RT vol, placement top-100)
+  - new rocket profile: 13 books/tick, 30 instr, 8s cadence, 10x10 rotation
+  - zero inactive_book_frac — sweep all 128 books for min_rt coverage
+  - cold-book pass: 8 books/tick at threshold 40 (top miners min_rt 3.5k+)
+  - touch-join at 2.5+ ticks for fill rate; completion edge held at 4.0 ticks
+  - flux profile: same throughput + tighter inventory (0.15% soft)
+targets: 3-5x RT volume, κ→0.3+ within 24h, placement top-50
 files:
   FluxPrimeAgent.py
   _ascend_agent_base.py

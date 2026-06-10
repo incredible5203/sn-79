@@ -4,7 +4,7 @@
 > **Package:** τaos **0.4.5**  
 > **Primary types:** `MarketSimulationStateUpdate` (validator → miner), `FinanceAgentResponse` (miner → validator)  
 > **Sources:** `taos/im/protocol`, `taos/im/agents`, `taos/im/validator/query.py`, `taos/im/validator/reward.py`, `agents/README.md`  
-> **See also:** [Market data from validators](./SN-79-market-data-from-validators.md) · [What market is this?](./SN-79-what-market-is-this.md)
+> **See also:** [Market data from validators](./SN-79-market-data-from-validators.md) · [Validator & simulator internals](./SN-79-validator-and-simulator-internals.md) · [What market is this?](./SN-79-what-market-is-this.md)
 
 ---
 
