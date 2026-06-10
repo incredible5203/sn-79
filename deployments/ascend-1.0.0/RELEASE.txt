@@ -1,18 +1,18 @@
-release_id=vault-1.4.0
-agent=VaultPrimeAgent
-profile=throughput
+release_id=flux-1.0.0
+agent=FluxPrimeAgent
+profile=flux
 git_commit=local
-bundled_at=2026-06-10T06:00:00Z
-notes=Maximum throughput aligned with UID 202/26/251 — 28 instr/tick, touch-join primary
+bundled_at=2026-06-10T08:00:00Z
+notes=Replace VaultPrimeAgent — custom vault_engine bled PnL; flux uses proven ascend_score_tick
 design:
-  - 11 books/tick, 28 instructions, 12x8 rotation (full 128-book coverage)
-  - Dedicated touch-join phase (10/tick) ranked by fill score + cold-book bonus
-  - Two-sided at 5.5+ ticks, completion at 5+ tick edge
-  - Tight inventory: 0.2%/0.5% skew, cross flatten at hard breach
-  - 12s cadence for faster κ observations
-targets: 1M+ RT volume, lean BASE (~5k), positive realized PnL, placement top-50
+  - ascend_score_tick engine (same as improving UIDs 10/65/158)
+  - flux profile: surge throughput + forge completion edge (6.5 ticks)
+  - touch-join at 4+ ticks only (not 3.5 — less adverse selection)
+  - tight inventory: 0.2% soft / 0.4% hard with cross flatten
+  - 11 books/tick, 28 instructions, 12x8 rotation
+  - cancel_all_on_startup clears bad resting orders from prior vault deploy
+targets: match UID 10/65 trajectory (κ→0+, rising RT vol, placement top-100)
 files:
-  VaultPrimeAgent.py
-  _vault_agent_base.py
-  vault_engine.py
+  FluxPrimeAgent.py
+  _ascend_agent_base.py
   competitive_utils.py

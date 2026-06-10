@@ -1,3 +1,4 @@
+# DEPRECATED: use FluxPrimeAgent for UID 209 (vault_engine bled PnL).
 # VaultPrimeAgent — high-growth SN-79 scoring (κ→1+, Penalty=0, +PnL)
 from __future__ import annotations
 

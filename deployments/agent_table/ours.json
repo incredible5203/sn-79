@@ -21,7 +21,7 @@
     },
     {
       "agent_id": "209",
-      "label": "deploy-vault-1.0.0",
+      "label": "deploy-flux-1.0.0",
       "deployment": "ascend-1.0.0",
       "run_script": "run_deploy_ascend.sh"
     }
