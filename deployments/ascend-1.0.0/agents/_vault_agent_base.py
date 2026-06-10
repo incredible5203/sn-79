@@ -25,24 +25,25 @@ from taos.im.protocol.instructions import OrderDirection
 from vault_engine import vault_score_tick
 
 _VAULT_DEFAULTS: dict[str, float | int] = {
-    "max_books_per_tick": 6,
-    "max_total_instructions": 14,
-    "max_instructions_per_book": 3,
-    "max_requote_per_tick": 5,
+    "max_books_per_tick": 8,
+    "max_total_instructions": 16,
+    "max_instructions_per_book": 4,
+    "max_requote_per_tick": 6,
     "book_rotation_groups": 16,
-    "cadence_interval_ns": 20_000_000_000,
-    "rotation_windows": 5,
-    "min_spread_ticks": 3.0,
-    "min_quote_spread_ticks": 4.0,
-    "min_rt_edge_ticks": 3.5,
-    "min_completion_edge_ticks": 4.0,
-    "min_two_sided_ticks": 8.0,
-    "min_microprice_edge_ticks": 1.2,
+    "cadence_interval_ns": 18_000_000_000,
+    "rotation_windows": 6,
+    "min_spread_ticks": 4.0,
+    "min_quote_spread_ticks": 5.0,
+    "min_rt_edge_ticks": 4.5,
+    "min_completion_edge_ticks": 5.0,
+    "min_two_sided_ticks": 10.0,
+    "touch_join_spread_ticks": 6.0,
+    "min_microprice_edge_ticks": 1.0,
     "max_spread_ratio": 0.0012,
-    "inventory_skew_soft": 0.004,
-    "inventory_skew_hard": 0.009,
+    "inventory_skew_soft": 0.003,
+    "inventory_skew_hard": 0.008,
     "inside_depth_ticks": 1,
-    "max_tape_imbalance": 0.30,
+    "max_tape_imbalance": 0.28,
     "max_flatten_per_tick": 8,
 }
 
@@ -85,6 +86,7 @@ class VaultAgent(FinanceSimulationAgent):
             )
         )
         self.min_two_sided_ticks = float(getattr(self.config, "min_two_sided_ticks", d["min_two_sided_ticks"]))
+        self.touch_join_spread_ticks = float(getattr(self.config, "touch_join_spread_ticks", d["touch_join_spread_ticks"]))
         self.min_microprice_edge_ticks = float(getattr(self.config, "min_microprice_edge_ticks", d["min_microprice_edge_ticks"]))
         self.max_spread_ratio = float(getattr(self.config, "max_spread_ratio", d["max_spread_ratio"]))
         self.inventory_skew_soft = float(getattr(self.config, "inventory_skew_soft", d["inventory_skew_soft"]))
@@ -111,6 +113,7 @@ class VaultAgent(FinanceSimulationAgent):
             f"rot={self.book_rotation_groups}x{self.rotation_windows} "
             f"min_spread={self.min_spread_ticks} min_rt={self.min_rt_edge_ticks} "
             f"min_comp={self.min_completion_edge_ticks} two_sided>={self.min_two_sided_ticks} "
+            f"touch_join>={self.touch_join_spread_ticks} "
             f"skew_soft={self.inventory_skew_soft} flatten/tick={self.max_flatten_per_tick} "
             f"cancel_all_on_startup={self.cancel_all_on_startup}"
         )
@@ -197,6 +200,7 @@ class VaultAgent(FinanceSimulationAgent):
             min_rt_edge_ticks=self.min_rt_edge_ticks,
             min_completion_edge_ticks=self.min_completion_edge_ticks,
             min_two_sided_ticks=self.min_two_sided_ticks,
+            touch_join_spread_ticks=self.touch_join_spread_ticks,
             min_microprice_edge_ticks=self.min_microprice_edge_ticks,
             max_spread_ratio=self.max_spread_ratio,
             inventory_skew_soft=self.inventory_skew_soft,

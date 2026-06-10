@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 """
-Vault scoring engine — always-on maker with PnL guardrails.
+Vault scoring engine — high fill rate with PnL guardrails.
 
-Balances two failure modes seen on UID 209:
-  v1.0 — always quoted but bled PnL on 2-tick spreads / loose skew
-  v1.1 — ascend delegate produced NO INSTRUCTIONS (7+ tick gates, risk_off halt)
+UID 209 lessons:
+  v1.0 — high volume but PnL bled on 2-tick churn
+  v1.2 — PnL still bleeds via join_touch bootstrap on tight spreads + cross flatten
 
-Rules:
-  - Always submit at least one order per tick (bootstrap fallback)
-  - Moderate spread gates (4-5 ticks) with completion edge checks
-  - Two-sided only on wide books (>=8 ticks) with capturable RT edge
-  - Tight inventory flatten (0.4%/0.9%) without risk_off shutdown
-  - Microprice bias with rotation fallback when edge is unclear
+v1.3 approach (match UID 202/26/251 fill patterns):
+  - Touch-join only on wide spreads with capturable RT edge (fill rate)
+  - Inside-spread quotes on moderate spreads (profitability)
+  - Completion legs require strong edge vs fill price
+  - Flatten inside-only (never cross — cross realizes losses)
+  - Bootstrap on widest book with edge, never blind join_touch
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from competitive_utils import (
     _limit_price,
     _rt_edge_ticks,
     _touch,
+    book_fill_score,
     cancel_stale_orders,
     inventory_skew,
     maker_fee_ok,
@@ -49,11 +50,11 @@ def _pick_direction(
     skew_soft: float,
     min_microprice_edge_ticks: float,
     tick: float,
-) -> OrderDirection | None:
+) -> OrderDirection:
     skew = inventory_skew(accounts, book_id, mid)
-    if skew > skew_soft * 0.4:
+    if skew > skew_soft * 0.35:
         return OrderDirection.SELL
-    if skew < -skew_soft * 0.4:
+    if skew < -skew_soft * 0.35:
         return OrderDirection.BUY
     mp = microprice(book)
     if mp is not None and tick > 0:
@@ -84,24 +85,25 @@ def vault_score_tick(
     max_fee_rate: float,
     quantity_scale: float,
     expiry_period: int,
-    max_books_per_tick: int = 6,
-    max_total_instructions: int = 14,
-    max_instructions_per_book: int = 3,
-    max_requote_per_tick: int = 5,
+    max_books_per_tick: int = 8,
+    max_total_instructions: int = 16,
+    max_instructions_per_book: int = 4,
+    max_requote_per_tick: int = 6,
     book_rotation_groups: int = 16,
-    cadence_interval_ns: int = 20_000_000_000,
-    rotation_windows: int = 5,
-    min_spread_ticks: float = 3.0,
-    min_quote_spread_ticks: float = 4.0,
-    min_rt_edge_ticks: float = 3.5,
-    min_completion_edge_ticks: float = 4.0,
-    min_two_sided_ticks: float = 8.0,
-    min_microprice_edge_ticks: float = 1.2,
+    cadence_interval_ns: int = 18_000_000_000,
+    rotation_windows: int = 6,
+    min_spread_ticks: float = 4.0,
+    min_quote_spread_ticks: float = 5.0,
+    min_rt_edge_ticks: float = 4.5,
+    min_completion_edge_ticks: float = 5.0,
+    min_two_sided_ticks: float = 10.0,
+    touch_join_spread_ticks: float = 6.0,
+    min_microprice_edge_ticks: float = 1.0,
     max_spread_ratio: float = 0.0012,
-    inventory_skew_soft: float = 0.004,
-    inventory_skew_hard: float = 0.009,
+    inventory_skew_soft: float = 0.003,
+    inventory_skew_hard: float = 0.008,
     inside_depth_ticks: int = 1,
-    max_tape_imbalance: float = 0.30,
+    max_tape_imbalance: float = 0.28,
     max_flatten_per_tick: int = 8,
 ) -> None:
     requote_hints = requote_hints or {}
@@ -211,7 +213,7 @@ def vault_score_tick(
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
-    # --- 2. Flatten material inventory skew ---
+    # --- 2. Flatten inventory skew (inside only — no cross) ---
     flatten_jobs: list[tuple[float, int, float, float, float, OrderDirection]] = []
     for book_id, (_book, best_bid, best_ask, mid) in book_rows.items():
         if _has_loan(accounts, book_id):
@@ -229,10 +231,8 @@ def vault_score_tick(
             break
         if book_id in placed:
             continue
-        skew = inventory_skew(accounts, book_id, mid)
-        mode = "cross" if abs(skew) >= inventory_skew_hard else "inside"
         price = _limit_price(
-            trade_dir, best_bid, best_ask, tick, pdec, mode=mode, depth_ticks=depth
+            trade_dir, best_bid, best_ask, tick, pdec, mode="inside", depth_ticks=depth
         )
         account = accounts[book_id]
         if trade_dir == OrderDirection.BUY:
@@ -253,7 +253,7 @@ def vault_score_tick(
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
-    # --- 3. Two-sided on wide spreads only ---
+    # --- 3. Two-sided on wide spreads ---
     two_sided: list[tuple[float, int, float, float, float]] = []
     for book_id, (_book, best_bid, best_ask, mid) in book_rows.items():
         if book_id in placed or _has_loan(accounts, book_id):
@@ -263,16 +263,16 @@ def vault_score_tick(
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
         if spread_ticks < min_two_sided_ticks:
             continue
-        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks + 1.0:
+        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks + 1.5:
             continue
         skew = inventory_skew(accounts, book_id, mid)
-        if abs(skew) > inventory_skew_soft * 0.35:
+        if abs(skew) > inventory_skew_soft * 0.25:
             continue
         two_sided.append((spread_ticks, book_id, best_bid, best_ask, mid))
     two_sided.sort(key=lambda x: -x[0])
 
     two_sided_count = 0
-    max_two_sided = max(1, max_books_per_tick // 3)
+    max_two_sided = max(2, max_books_per_tick // 4)
     for _spread, book_id, best_bid, best_ask, mid in two_sided:
         if two_sided_count >= max_two_sided or budget.total >= max_total_instructions:
             break
@@ -306,7 +306,64 @@ def vault_score_tick(
             placed.add(book_id)
             two_sided_count += 1
 
-    # --- 4. Single-sided rotation quotes ---
+    # --- 4. Touch-join on widest spreads (fill rate like top miners) ---
+    touch_jobs: list[tuple[float, int, Book, float, float, float]] = []
+    for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
+        if book_id in placed or _has_loan(accounts, book_id):
+            continue
+        if (book_id % book_rotation_groups) not in active_rots:
+            continue
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < touch_join_spread_ticks:
+            continue
+        rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
+        if rt_edge < min_rt_edge_ticks:
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        if abs(skew) >= inventory_skew_soft:
+            continue
+        fill_sc = book_fill_score(
+            book, accounts, book_id, spread_ticks=spread_ticks, requote=False
+        )
+        touch_jobs.append((fill_sc + spread_ticks, book_id, book, best_bid, best_ask, mid))
+    touch_jobs.sort(key=lambda x: -x[0])
+
+    touch_count = 0
+    max_touch = max(2, max_books_per_tick // 3)
+    for _rank, book_id, book, best_bid, best_ask, mid in touch_jobs:
+        if touch_count >= max_touch or budget.total >= max_total_instructions:
+            break
+        if book_id in placed:
+            continue
+        trade_dir = _pick_direction(
+            book, book_id, mid, accounts, rot,
+            skew_soft=inventory_skew_soft,
+            min_microprice_edge_ticks=min_microprice_edge_ticks,
+            tick=tick,
+        )
+        price = _limit_price(
+            trade_dir, best_bid, best_ask, tick, pdec, mode="join_touch"
+        )
+        account = accounts[book_id]
+        if trade_dir == OrderDirection.BUY:
+            if price >= best_ask or account.quote_balance.free < qty * price:
+                continue
+        elif price <= best_bid or account.base_balance.free < qty:
+            continue
+        if not budget.can_place(book_id, 1):
+            continue
+        place_limit(
+            response, book_id, trade_dir, qty, price, expiry_period,
+            volume_decimals=vdec, min_quantity=min_quantity,
+        )
+        budget.mark(book_id, 1)
+        placed.add(book_id)
+        touch_count += 1
+        direction[book_id] = (
+            OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
+        )
+
+    # --- 5. Inside-spread rotation quotes ---
     single_jobs: list[tuple[float, int, Book, float, float, float]] = []
     for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
         if book_id in placed or _has_loan(accounts, book_id):
@@ -336,8 +393,6 @@ def vault_score_tick(
             min_microprice_edge_ticks=min_microprice_edge_ticks,
             tick=tick,
         )
-        if trade_dir is None:
-            continue
         price = _limit_price(
             trade_dir, best_bid, best_ask, tick, pdec, mode="inside", depth_ticks=depth
         )
@@ -360,24 +415,38 @@ def vault_score_tick(
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
-    # --- 5. Bootstrap: guarantee at least one order per tick ---
+    # --- 6. Bootstrap: widest book with capturable edge ---
     if not response.instructions:
-        for book_id in sorted(book_rows.keys()):
-            book, best_bid, best_ask, mid = book_rows[book_id]
+        bootstrap_jobs: list[tuple[float, int, Book, float, float, float]] = []
+        for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
             if _has_loan(accounts, book_id):
                 continue
             spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
             if spread_ticks < min_spread_ticks:
                 continue
+            if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
+                continue
+            bootstrap_jobs.append((spread_ticks, book_id, book, best_bid, best_ask, mid))
+        bootstrap_jobs.sort(key=lambda x: -x[0])
+        for spread_ticks, book_id, book, best_bid, best_ask, mid in bootstrap_jobs:
             trade_dir = _pick_direction(
                 book, book_id, mid, accounts, rot,
                 skew_soft=inventory_skew_soft,
                 min_microprice_edge_ticks=min_microprice_edge_ticks,
                 tick=tick,
             )
-            if trade_dir is None:
+            rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
+            skew = inventory_skew(accounts, book_id, mid)
+            if (
+                spread_ticks >= touch_join_spread_ticks
+                and rt_edge >= min_rt_edge_ticks
+                and abs(skew) < inventory_skew_soft * 0.5
+            ):
+                mode = "join_touch"
+            elif spread_ticks >= min_quote_spread_ticks:
+                mode = "inside"
+            else:
                 continue
-            mode = "inside" if spread_ticks >= min_quote_spread_ticks else "join_touch"
             price = _limit_price(
                 trade_dir, best_bid, best_ask, tick, pdec, mode=mode, depth_ticks=depth
             )
