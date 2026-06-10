@@ -16,6 +16,7 @@ import bittensor as bt
 from competitive_utils import (
     _InstructionBudget,
     ascend_score_tick,
+    kappa_blitz_score_tick,
     param_bool,
     startup_cancel_all_orders,
 )
@@ -227,6 +228,29 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
         "max_cold_books_per_tick": 6,
         "max_tape_imbalance": 0.26,
         "risk_off_skewed_books": 4,
+    },
+    "blitz": {
+        "max_books_per_tick": 10,
+        "max_total_instructions": 28,
+        "max_instructions_per_book": 5,
+        "max_requote_per_tick": 8,
+        "max_cold_books_per_tick": 12,
+        "book_rotation_groups": 8,
+        "cadence_interval_ns": 10_000_000_000,
+        "rotation_windows": 8,
+        "min_spread_ticks": 5.0,
+        "min_quote_spread_ticks": 5.5,
+        "min_rt_edge_ticks": 5.0,
+        "min_quote_rt_edge_ticks": 5.5,
+        "min_completion_rt_edge_ticks": 5.5,
+        "min_microprice_edge_ticks": 1.0,
+        "inside_depth_ticks": 1,
+        "max_spread_ratio": 0.0012,
+        "inventory_skew_soft": 0.006,
+        "inventory_skew_hard": 0.012,
+        "cold_book_volume_threshold": 5000.0,
+        "max_tape_imbalance": 0.25,
+        "use_fill_score_ranking": True,
     },
 }
 
@@ -453,6 +477,14 @@ class AscendAgent(FinanceSimulationAgent):
                 defaults.get("max_cold_books_per_tick", 4),
             )
         )
+        self.use_fill_score_ranking = param_bool(
+            getattr(
+                self.config,
+                "use_fill_score_ranking",
+                defaults.get("use_fill_score_ranking", False),
+            ),
+            False,
+        )
         self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 8))
 
         self.cancel_all_on_startup = param_bool(
@@ -478,6 +510,7 @@ class AscendAgent(FinanceSimulationAgent):
             f"two_sided>={self.two_sided_wide_ticks} "
             f"skew_soft={self.inventory_skew_soft} "
             f"inactive_skip={self.inactive_book_frac} "
+            f"cold/tick={self.max_cold_books_per_tick} "
             f"cancel_all_on_startup={self.cancel_all_on_startup}"
         )
 
@@ -537,6 +570,44 @@ class AscendAgent(FinanceSimulationAgent):
         if self._run_startup_cancel_all(response):
             return response
         self._decay_requote()
+        if self.ascend_profile == "blitz":
+            kappa_blitz_score_tick(
+                response,
+                state,
+                self.accounts,
+                self.simulation_config,
+                self.direction,
+                last_mid=self._last_mid,
+                mids_scratch=self._mids_scratch,
+                requote_hints=self._requote_hints(),
+                min_quantity=self.min_quantity,
+                max_quantity=self.max_quantity,
+                max_fee_rate=self.max_fee_rate,
+                quantity_scale=self.quantity_scale,
+                expiry_period=self.expiry_period,
+                inventory_skew_soft=self.inventory_skew_soft,
+                inventory_skew_hard=self.inventory_skew_hard,
+                max_books_per_tick=self.max_books_per_tick,
+                max_instructions_per_book=self.max_instructions_per_book,
+                max_total_instructions=self.max_total_instructions,
+                max_requote_per_tick=self.max_requote_per_tick,
+                max_cold_books_per_tick=self.max_cold_books_per_tick,
+                book_rotation_groups=self.book_rotation_groups,
+                cadence_interval_ns=self.cadence_interval_ns,
+                rotation_windows=self.rotation_windows,
+                max_spread_ratio=self.max_spread_ratio,
+                min_spread_ticks=self.min_spread_ticks,
+                min_rt_edge_ticks=self.min_rt_edge_ticks,
+                min_completion_rt_edge_ticks=self.min_completion_rt_edge_ticks,
+                min_quote_spread_ticks=self.min_quote_spread_ticks,
+                min_quote_rt_edge_ticks=self.min_quote_rt_edge_ticks,
+                min_microprice_edge_ticks=self.min_microprice_edge_ticks,
+                max_tape_imbalance=self.max_tape_imbalance,
+                cold_book_volume_threshold=self.cold_book_volume_threshold,
+                inside_depth_ticks=self.inside_depth_ticks,
+                use_fill_score_ranking=self.use_fill_score_ranking,
+            )
+            return response
         ascend_score_tick(
             response,
             state,

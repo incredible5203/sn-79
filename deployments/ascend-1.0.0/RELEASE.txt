@@ -1,17 +1,24 @@
-release_id=flux-1.4.0
+release_id=flux-2.0.0-blitz
 agent=FluxPrimeAgent
-profile=flux
+profile=blitz
 git_commit=local
-bundled_at=2026-06-10T16:00:00Z
-notes=Fast growth tune — rocket profile for UIDs 10/65, flux for UID 209
+bundled_at=2026-06-10T18:00:00Z
+notes=Immunity-period kappa blitz test for UID 209
 design:
-  - new rocket profile: 13 books/tick, 30 instr, 8s cadence, 10x10 rotation
-  - zero inactive_book_frac — sweep all 128 books for min_rt coverage
-  - cold-book pass: 8 books/tick at threshold 40 (top miners min_rt 3.5k+)
-  - touch-join at 2.5+ ticks for fill rate; completion edge held at 4.0 ticks
-  - flux profile: same throughput + tighter inventory (0.15% soft)
-targets: 3-5x RT volume, κ→0.3+ within 24h, placement top-50
+  - kappa_blitz_score_tick engine (NOT ascend/flux/rocket)
+  - Phase 1: completion legs after maker fills (5.5 tick min edge vs fill)
+  - Phase 2: inventory flatten
+  - Phase 3: mandatory cold-book sweep (12 books/tick, threshold 5000)
+  - Phase 4: microprice-gated quality quotes on 8x8 rotation
+  - NO touch-join, NO two-sided (209 had negative kappa on flux)
+  - cancel_all_on_startup=1 clears toxic resting orders
+targets:
+  - min_rt > 0 (was 0.0 — kappa penalty)
+  - activity -> 1.0 (was 0.75)
+  - kappa -> positive within immunity window
+  - avg_rt toward 30k+ before scaling aggression
 files:
   FluxPrimeAgent.py
   _ascend_agent_base.py
   competitive_utils.py
+  validator_exchange_log.py
