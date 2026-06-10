@@ -230,27 +230,56 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
         "risk_off_skewed_books": 4,
     },
     "blitz": {
-        "max_books_per_tick": 10,
-        "max_total_instructions": 28,
+        "max_books_per_tick": 12,
+        "max_total_instructions": 30,
         "max_instructions_per_book": 5,
-        "max_requote_per_tick": 8,
-        "max_cold_books_per_tick": 12,
-        "book_rotation_groups": 8,
+        "max_requote_per_tick": 10,
+        "max_cold_books_per_tick": 14,
+        "book_rotation_groups": 6,
         "cadence_interval_ns": 10_000_000_000,
-        "rotation_windows": 8,
+        "rotation_windows": 10,
         "min_spread_ticks": 5.0,
         "min_quote_spread_ticks": 5.5,
         "min_rt_edge_ticks": 5.0,
         "min_quote_rt_edge_ticks": 5.5,
         "min_completion_rt_edge_ticks": 5.5,
+        "min_cold_spread_ticks": 4.0,
+        "min_cold_rt_edge_ticks": 4.5,
         "min_microprice_edge_ticks": 1.0,
         "inside_depth_ticks": 1,
         "max_spread_ratio": 0.0012,
         "inventory_skew_soft": 0.006,
         "inventory_skew_hard": 0.012,
-        "cold_book_volume_threshold": 5000.0,
+        "cold_book_volume_threshold": 2500.0,
         "max_tape_imbalance": 0.25,
         "use_fill_score_ranking": True,
+    },
+    "blitz+": {
+        "max_books_per_tick": 12,
+        "max_total_instructions": 30,
+        "max_instructions_per_book": 5,
+        "max_requote_per_tick": 10,
+        "max_cold_books_per_tick": 14,
+        "book_rotation_groups": 6,
+        "cadence_interval_ns": 10_000_000_000,
+        "rotation_windows": 10,
+        "min_spread_ticks": 5.0,
+        "min_quote_spread_ticks": 5.5,
+        "min_rt_edge_ticks": 5.0,
+        "min_quote_rt_edge_ticks": 5.5,
+        "min_completion_rt_edge_ticks": 5.5,
+        "min_cold_spread_ticks": 4.0,
+        "min_cold_rt_edge_ticks": 4.5,
+        "min_microprice_edge_ticks": 1.0,
+        "inside_depth_ticks": 1,
+        "max_spread_ratio": 0.0012,
+        "inventory_skew_soft": 0.006,
+        "inventory_skew_hard": 0.012,
+        "cold_book_volume_threshold": 2500.0,
+        "max_tape_imbalance": 0.25,
+        "use_fill_score_ranking": True,
+        "touch_join_spread_ticks": 6.0,
+        "max_touch_per_tick": 4,
     },
 }
 
@@ -404,6 +433,26 @@ class AscendAgent(FinanceSimulationAgent):
                 defaults.get(
                     "min_quote_rt_edge_ticks",
                     defaults.get("min_rt_edge_ticks", 7.0),
+                ),
+            )
+        )
+        self.min_cold_spread_ticks = float(
+            getattr(
+                self.config,
+                "min_cold_spread_ticks",
+                defaults.get(
+                    "min_cold_spread_ticks",
+                    defaults.get("min_spread_ticks", 5.0),
+                ),
+            )
+        )
+        self.min_cold_rt_edge_ticks = float(
+            getattr(
+                self.config,
+                "min_cold_rt_edge_ticks",
+                defaults.get(
+                    "min_cold_rt_edge_ticks",
+                    defaults.get("min_rt_edge_ticks", 5.0),
                 ),
             )
         )
@@ -570,7 +619,7 @@ class AscendAgent(FinanceSimulationAgent):
         if self._run_startup_cancel_all(response):
             return response
         self._decay_requote()
-        if self.ascend_profile == "blitz":
+        if self.ascend_profile in ("blitz", "blitz+"):
             kappa_blitz_score_tick(
                 response,
                 state,
@@ -601,11 +650,17 @@ class AscendAgent(FinanceSimulationAgent):
                 min_completion_rt_edge_ticks=self.min_completion_rt_edge_ticks,
                 min_quote_spread_ticks=self.min_quote_spread_ticks,
                 min_quote_rt_edge_ticks=self.min_quote_rt_edge_ticks,
+                min_cold_spread_ticks=self.min_cold_spread_ticks,
+                min_cold_rt_edge_ticks=self.min_cold_rt_edge_ticks,
                 min_microprice_edge_ticks=self.min_microprice_edge_ticks,
                 max_tape_imbalance=self.max_tape_imbalance,
                 cold_book_volume_threshold=self.cold_book_volume_threshold,
                 inside_depth_ticks=self.inside_depth_ticks,
                 use_fill_score_ranking=self.use_fill_score_ranking,
+                touch_join_spread_ticks=self.touch_join_spread_ticks,
+                max_touch_per_tick=(
+                    self.max_touch_per_tick if self.ascend_profile == "blitz+" else 0
+                ),
             )
             return response
         ascend_score_tick(

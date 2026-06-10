@@ -1,22 +1,34 @@
-release_id=flux-2.0.0-blitz
+release_id=flux-2.1.0-blitz-cov
 agent=FluxPrimeAgent
 profile=blitz
 git_commit=local
-bundled_at=2026-06-10T18:00:00Z
-notes=Immunity-period kappa blitz test for UID 209
+bundled_at=2026-06-10T19:00:00Z
+notes=Phase-2 coverage update for UID 209 (kappa still negative — no size/touch bump)
 design:
   - kappa_blitz_score_tick engine (NOT ascend/flux/rocket)
   - Phase 1: completion legs after maker fills (5.5 tick min edge vs fill)
   - Phase 2: inventory flatten
-  - Phase 3: mandatory cold-book sweep (12 books/tick, threshold 5000)
-  - Phase 4: microprice-gated quality quotes on 8x8 rotation
-  - NO touch-join, NO two-sided (209 had negative kappa on flux)
+  - Phase 3: mandatory cold-book sweep (14 books/tick, threshold 2500)
+  - Phase 4: microprice-gated quality quotes on 6x10 rotation
+  - Relaxed cold thresholds: 4.0 spread / 4.0 rt for zero-volume books
+  - NO touch-join on blitz (blitz+ profile ready when kappa > 0.15)
   - cancel_all_on_startup=1 clears toxic resting orders
+changes_from_2.0.0:
+  - max_books_per_tick: 10 -> 12
+  - max_cold_books_per_tick: 12 -> 14
+  - max_total_instructions: 28 -> 30
+  - max_requote_per_tick: 8 -> 10
+  - book_rotation_groups: 8 -> 6, rotation_windows: 8 -> 10
+  - cold_book_volume_threshold: 5000 -> 2500
+  - min_cold_spread_ticks: 4.0, min_cold_rt_edge_ticks: 4.5
 targets:
   - min_rt > 0 (was 0.0 — kappa penalty)
-  - activity -> 1.0 (was 0.75)
+  - activity -> 1.0 (was 0.875)
   - kappa -> positive within immunity window
   - avg_rt toward 30k+ before scaling aggression
+next_gates:
+  - kappa > 0.1 and pnl >= 0: max_quantity 0.40
+  - kappa > 0.15 and penalty ~ 0: switch to blitz+ profile
 files:
   FluxPrimeAgent.py
   _ascend_agent_base.py
