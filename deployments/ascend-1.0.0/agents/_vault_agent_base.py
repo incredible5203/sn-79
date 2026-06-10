@@ -25,26 +25,28 @@ from taos.im.protocol.instructions import OrderDirection
 from vault_engine import vault_score_tick
 
 _VAULT_DEFAULTS: dict[str, float | int] = {
-    "max_books_per_tick": 8,
-    "max_total_instructions": 16,
-    "max_instructions_per_book": 4,
-    "max_requote_per_tick": 6,
-    "book_rotation_groups": 16,
-    "cadence_interval_ns": 18_000_000_000,
-    "rotation_windows": 6,
-    "min_spread_ticks": 4.0,
-    "min_quote_spread_ticks": 5.0,
-    "min_rt_edge_ticks": 4.5,
+    "max_books_per_tick": 11,
+    "max_total_instructions": 28,
+    "max_instructions_per_book": 5,
+    "max_requote_per_tick": 9,
+    "max_touch_per_tick": 10,
+    "book_rotation_groups": 12,
+    "cadence_interval_ns": 12_000_000_000,
+    "rotation_windows": 8,
+    "min_spread_ticks": 3.0,
+    "min_quote_spread_ticks": 3.5,
+    "min_rt_edge_ticks": 3.0,
     "min_completion_edge_ticks": 5.0,
-    "min_two_sided_ticks": 10.0,
-    "touch_join_spread_ticks": 6.0,
-    "min_microprice_edge_ticks": 1.0,
-    "max_spread_ratio": 0.0012,
-    "inventory_skew_soft": 0.003,
-    "inventory_skew_hard": 0.008,
+    "min_two_sided_ticks": 5.5,
+    "touch_join_spread_ticks": 3.5,
+    "min_microprice_edge_ticks": 0.7,
+    "max_spread_ratio": 0.0013,
+    "inventory_skew_soft": 0.002,
+    "inventory_skew_hard": 0.005,
     "inside_depth_ticks": 1,
-    "max_tape_imbalance": 0.28,
-    "max_flatten_per_tick": 8,
+    "max_tape_imbalance": 0.30,
+    "max_flatten_per_tick": 12,
+    "cold_book_volume_threshold": 250.0,
 }
 
 
@@ -72,6 +74,7 @@ class VaultAgent(FinanceSimulationAgent):
         self.max_total_instructions = int(getattr(self.config, "max_total_instructions", d["max_total_instructions"]))
         self.max_instructions_per_book = int(getattr(self.config, "max_instructions_per_book", d["max_instructions_per_book"]))
         self.max_requote_per_tick = int(getattr(self.config, "max_requote_per_tick", d["max_requote_per_tick"]))
+        self.max_touch_per_tick = int(getattr(self.config, "max_touch_per_tick", d["max_touch_per_tick"]))
         self.book_rotation_groups = int(getattr(self.config, "book_rotation_groups", d["book_rotation_groups"]))
         self.cadence_interval_ns = int(getattr(self.config, "cadence_interval_ns", d["cadence_interval_ns"]))
         self.rotation_windows = int(getattr(self.config, "rotation_windows", d["rotation_windows"]))
@@ -94,6 +97,9 @@ class VaultAgent(FinanceSimulationAgent):
         self.inside_depth_ticks = int(getattr(self.config, "inside_depth_ticks", d["inside_depth_ticks"]))
         self.max_tape_imbalance = float(getattr(self.config, "max_tape_imbalance", d["max_tape_imbalance"]))
         self.max_flatten_per_tick = int(getattr(self.config, "max_flatten_per_tick", d["max_flatten_per_tick"]))
+        self.cold_book_volume_threshold = float(
+            getattr(self.config, "cold_book_volume_threshold", d["cold_book_volume_threshold"])
+        )
         self.requote_ttl_ticks = int(getattr(self.config, "requote_ttl_ticks", 6))
 
         self.cancel_all_on_startup = param_bool(
@@ -192,6 +198,7 @@ class VaultAgent(FinanceSimulationAgent):
             max_total_instructions=self.max_total_instructions,
             max_instructions_per_book=self.max_instructions_per_book,
             max_requote_per_tick=self.max_requote_per_tick,
+            max_touch_per_tick=self.max_touch_per_tick,
             book_rotation_groups=self.book_rotation_groups,
             cadence_interval_ns=self.cadence_interval_ns,
             rotation_windows=self.rotation_windows,
@@ -208,5 +215,6 @@ class VaultAgent(FinanceSimulationAgent):
             inside_depth_ticks=self.inside_depth_ticks,
             max_tape_imbalance=self.max_tape_imbalance,
             max_flatten_per_tick=self.max_flatten_per_tick,
+            cold_book_volume_threshold=self.cold_book_volume_threshold,
         )
         return response

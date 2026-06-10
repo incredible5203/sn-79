@@ -1603,8 +1603,9 @@ def ascend_score_tick(
     inactive_book_frac: float = 0.25,
     risk_off_skewed_books: int = 2,
     two_sided_wide_ticks: float = 0.0,
-    max_flatten_per_tick: int = 8,
-    touch_join_spread_ticks: float = 6.0,
+    max_flatten_per_tick: int = 12,
+    touch_join_spread_ticks: float = 4.5,
+    max_touch_per_tick: int = 8,
 ) -> None:
     """
     Ascend scoring engine — fast κ growth, Penalty → 0, positive realized PnL.
@@ -1802,6 +1803,88 @@ def ascend_score_tick(
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
+    touch_jobs: list[tuple[float, int, Book, float, float, float]] = []
+    for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
+        if book_id in placed or _has_loan(accounts, book_id):
+            continue
+        if (book_id % book_rotation_groups) not in active_rots:
+            continue
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < touch_join_spread_ticks:
+            continue
+        rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
+        if rt_edge < quote_rt_edge:
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        if abs(skew) >= inventory_skew_soft * 0.3:
+            continue
+        traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
+        if traded < cold_book_volume_threshold * 0.1:
+            cold_bonus = 8.0
+        elif traded < cold_book_volume_threshold:
+            cold_bonus = 4.0
+        else:
+            cold_bonus = 0.0
+        fill_sc = book_fill_score(
+            book, accounts, book_id, spread_ticks=spread_ticks, requote=False
+        )
+        touch_jobs.append(
+            (fill_sc + spread_ticks * 0.6 + cold_bonus, book_id, book, best_bid, best_ask, mid)
+        )
+    touch_jobs.sort(key=lambda x: -x[0])
+
+    touch_count = 0
+    for _rank, book_id, book, best_bid, best_ask, mid in touch_jobs:
+        if touch_count >= max_touch_per_tick or budget.total >= max_total_instructions:
+            break
+        if book_id in placed:
+            continue
+        skew = inventory_skew(accounts, book_id, mid)
+        mp = microprice(book)
+        if skew > 0.0015:
+            trade_dir = OrderDirection.SELL
+        elif skew < -0.0015:
+            trade_dir = OrderDirection.BUY
+        elif mp is not None and tick > 0:
+            edge_ticks = (mp - mid) / tick
+            if edge_ticks >= min_microprice_edge_ticks:
+                trade_dir = OrderDirection.BUY
+            elif edge_ticks <= -min_microprice_edge_ticks:
+                trade_dir = OrderDirection.SELL
+            else:
+                trade_dir = (
+                    OrderDirection.BUY
+                    if (book_id + rot) % 2 == 0
+                    else OrderDirection.SELL
+                )
+        else:
+            trade_dir = (
+                OrderDirection.BUY
+                if (book_id + rot) % 2 == 0
+                else OrderDirection.SELL
+            )
+        price = _limit_price(
+            trade_dir, best_bid, best_ask, tick, pdec, mode="join_touch"
+        )
+        account = accounts[book_id]
+        if trade_dir == OrderDirection.BUY:
+            if price >= best_ask or account.quote_balance.free < qty * price:
+                continue
+        elif price <= best_bid or account.base_balance.free < qty:
+            continue
+        if not budget.can_place(book_id, 1):
+            continue
+        place_limit(
+            response, book_id, trade_dir, qty, price, expiry_period,
+            volume_decimals=vdec, min_quantity=min_quantity,
+        )
+        budget.mark(book_id, 1)
+        placed.add(book_id)
+        touch_count += 1
+        direction[book_id] = (
+            OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
+        )
+
     if risk_off:
         for book_id, (_book, best_bid, best_ask, _mid) in sorted(book_rows.items()):
             if budget.total >= max_total_instructions:
@@ -1872,7 +1955,7 @@ def ascend_score_tick(
         if (
             two_sided_wide_ticks > 0
             and spread_ticks >= two_sided_wide_ticks
-            and abs(skew) < 0.001
+            and abs(skew) < 0.0008
             and budget.can_place(book_id, 2)
         ):
             buy_price = _limit_price(
@@ -1923,17 +2006,8 @@ def ascend_score_tick(
             )
         else:
             continue
-        rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
-        if (
-            spread_ticks >= touch_join_spread_ticks
-            and rt_edge >= quote_rt_floor
-            and abs(skew) < inventory_skew_soft * 0.45
-        ):
-            quote_mode = "join_touch"
-        else:
-            quote_mode = "inside"
         price = _limit_price(
-            trade_dir, best_bid, best_ask, tick, pdec, mode=quote_mode, depth_ticks=depth
+            trade_dir, best_bid, best_ask, tick, pdec, mode="inside", depth_ticks=depth
         )
         if trade_dir == OrderDirection.BUY:
             if price >= best_ask or account.quote_balance.free < qty * price:

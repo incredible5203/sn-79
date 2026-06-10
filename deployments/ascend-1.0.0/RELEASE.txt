@@ -1,17 +1,16 @@
-release_id=vault-1.3.0
+release_id=vault-1.4.0
 agent=VaultPrimeAgent
-profile=balanced-fill
+profile=throughput
 git_commit=local
-bundled_at=2026-06-10T04:00:00Z
-notes=High fill rate + PnL guardrails — touch-join on wide spreads, no cross flatten
+bundled_at=2026-06-10T06:00:00Z
+notes=Maximum throughput aligned with UID 202/26/251 — 28 instr/tick, touch-join primary
 design:
-  - Touch-join phase on 6+ tick spreads with RT edge (match UID 202/26 fill rate)
-  - Inside-spread quotes on 5+ tick spreads (profitability)
-  - Completion requires 5+ tick edge vs fill price
-  - Flatten inside-only (removed cross — was realizing losses)
-  - Bootstrap widest book with edge only (no blind join_touch)
-  - 8 books/tick, 16 instructions, 16x6 rotation
-targets: rising RT volume, positive realized PnL, κ observations, penalty=0
+  - 11 books/tick, 28 instructions, 12x8 rotation (full 128-book coverage)
+  - Dedicated touch-join phase (10/tick) ranked by fill score + cold-book bonus
+  - Two-sided at 5.5+ ticks, completion at 5+ tick edge
+  - Tight inventory: 0.2%/0.5% skew, cross flatten at hard breach
+  - 12s cadence for faster κ observations
+targets: 1M+ RT volume, lean BASE (~5k), positive realized PnL, placement top-50
 files:
   VaultPrimeAgent.py
   _vault_agent_base.py
