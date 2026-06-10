@@ -1,17 +1,18 @@
-release_id=vault-1.0.0
+release_id=vault-1.2.0
 agent=VaultPrimeAgent
-profile=prime
+profile=balanced
 git_commit=local
-bundled_at=2026-06-10T01:50:00Z
-notes=Fresh Vault engine — replaces broken Ascend v1.2 (NO INSTRUCTIONS due to risk_off + microprice gates)
+bundled_at=2026-06-10T03:30:00Z
+notes=Balanced vault — always-on quoting with PnL guardrails (fixes v1.1 NO INSTRUCTIONS)
 design:
-  - Always-on quoting with bootstrap fallback (never empty ticks)
-  - Two-sided inside-spread quotes for κ round-trip observations
-  - Completion legs after maker fills for positive realized PnL
-  - 16x6 rotation → uniform coverage across 128 books → Penalty=0
-  - No risk_off shutdown; skew flatten only at 6%+ imbalance
-  - Lower spread gates (2-3 ticks vs Ascend 7-8.5)
-targets: κ→0.8→1+, penalty=0, positive rising realized PnL, fast incentive
+  - Bootstrap fallback guarantees at least one order per tick
+  - Moderate spread gates (3-4 ticks) vs v1.1 ascend-delegate (7-8.5)
+  - Two-sided only on wide books (>=8 ticks) with RT edge check
+  - Completion legs require 4+ tick edge vs fill price
+  - Tight inventory flatten (0.4%/0.9%) without risk_off shutdown
+  - Microprice bias with rotation fallback when edge unclear
+  - Stale order cancels every tick
+targets: κ growth, penalty=0, positive realized PnL, never empty ticks
 files:
   VaultPrimeAgent.py
   _vault_agent_base.py
