@@ -197,6 +197,144 @@ Where:
 - `τ` = threshold return (default 0.0)
 - `LPM₃` = third lower partial moment (downside risk)
 
+Computed **per order book**, then aggregated (median across books, with outlier penalty). Uses only **realized P&L from completed round-trip trades** — not mark-to-market or open positions. Implementation: `taos/im/utils/kappa.py`.
+
+#### Formula parameters (detailed)
+
+##### μ — mean return
+
+**What it is:** The average return per observation in the lookback window.
+
+**What counts as an observation:**
+- Each time the validator samples realized P&L (roughly every `Simulation.step` sim nanoseconds).
+- Only **closed round-trips** count: buy → sell (or sell → buy) on the same book, with P&L locked in.
+- Open inventory does **not** enter κ until the opposite leg completes.
+
+**How it is computed** (`kappa_3()` in `taos/im/utils/kappa.py`):
+
+1. Build a time series of **raw realized P&L** per book over the lookback window (~3 sim hours by default).
+2. **Normalize** each book's series by its **MAD** (median absolute deviation):
+
+   ```
+   r_t = PnL_t / MAD
+   ```
+
+   This makes κ comparable across books with different volatility and scale.
+
+3. Take the **mean** of those normalized returns:
+
+   ```
+   μ = mean(r_1, r_2, …, r_n)
+   ```
+
+**Intuition:**
+- **Positive μ** → on average, round-trips are profitable after normalization.
+- **Negative μ** → losing on average; the numerator pulls κ down.
+- μ is **not** total P&L in dollars — it is average **risk-adjusted return per sample**.
+
+**Minimum data:** At least **3 non-zero** realized observations per book (`kappa.min_realized_observations`) and enough sim time (`kappa.min_lookback` ≈ 5400s) before κ is valid. Books with insufficient round-trips show no κ (dashboard `min_roundtrip_volume = 0` → kappa penalty).
+
+##### τ — threshold return (target minimum)
+
+**What it is:** The return level the miner must **beat** for the numerator to be positive. Default: **τ = 0.0**.
+
+**Role in the formula:**
+
+```
+numerator = μ - τ
+```
+
+- If **μ > τ** (e.g. μ = 0.05, τ = 0) → numerator is positive → κ can be positive (if downside is controlled).
+- If **μ ≤ τ** → numerator is zero or negative → κ is weak or zero regardless of low downside risk.
+
+**Role in LPM₃:** τ is also the **cutoff** for what counts as a "bad" return (see below).
+
+**Practical meaning:**
+- τ = 0 means: only strategies that beat **breakeven** on average are rewarded in the numerator.
+- A miner with μ = 0.01 and low downside can get positive κ.
+- A miner with μ = -0.02 loses in the numerator even if losses are small and consistent.
+
+Validators can change τ via config; default is **0** (breakeven hurdle).
+
+##### LPM₃(τ) — third lower partial moment (downside risk)
+
+**What it is:** A measure of **how bad losing observations are**, relative to τ. Only returns **below** τ contribute.
+
+**Definition** (per book, on MAD-normalized returns):
+
+For each observation `r_t`:
+
+```
+downside_t = max(τ - r_t, 0)
+```
+
+Then:
+
+```
+LPM₃(τ) = mean(downside_1³, downside_2³, …, downside_n³)
+```
+
+**Examples** (τ = 0):
+
+| Observation r_t | downside = max(0 − r_t, 0) | contribution to LPM₃ |
+|-----------------|----------------------------|----------------------|
+| +0.05 (win)     | 0                          | 0                    |
+| 0 (flat)        | 0                          | 0                    |
+| −0.01 (small loss) | 0.01                    | 0.01³ = 1×10⁻⁶       |
+| −0.10 (big loss)   | 0.10                    | 0.10³ = 0.001        |
+
+**Key properties:**
+- **Only losses below τ count.** Wins do not reduce LPM₃.
+- **Cubing** makes large losses dominate: one −0.10 hurts far more than ten −0.01 losses.
+- That is why κ is "risk-adjusted": high average return with **fat left tail** (occasional blowups) gets punished heavily.
+
+**Why the cube root in the denominator?**
+
+```
+K₃ = (μ - τ) / LPM₃^(1/3)
+```
+
+LPM₃ is already a **third** moment (everything is cubed). The **cube root** puts the denominator back on a similar scale to μ, so the ratio behaves like "return per unit of downside risk" — analogous to Sharpe, but using **downside-only** risk instead of total volatility.
+
+**Special cases in code** (`kappa.py`):
+- If **negligible downside** (LPM₃ ≈ 0) but **μ > τ**, the implementation uses **UPM₃** (upper partial moment) so miners with only upside still get a finite, scale-invariant score.
+- If **μ ≤ τ** with no meaningful downside, κ is set to **0**.
+
+#### How the three terms interact
+
+```
+Completed round-trips
+    → Realized P&L time series
+    → MAD normalize per book
+        → μ = mean return          ──┐
+        → LPM₃ = mean(max(τ−r,0)³) ──┼→ K₃ = (μ − τ) / LPM₃^(1/3)
+                                    ──┘
+```
+
+| Scenario | μ | LPM₃ | κ tendency |
+|----------|---|------|------------|
+| Steady small wins, rare big losses | High | High (big losses cubed) | **Low** — denominator explodes |
+| Steady small wins, no big losses | High | Low | **High** — ideal for SN-79 |
+| Breakeven, volatile | ~0 | Medium | **Low** — numerator ~0 |
+| Losing on average | Negative | Any | **Negative / zero** — bad numerator |
+| Few round-trips | N/A | N/A | **No κ** — insufficient data |
+
+#### What K₃(τ) is *not*
+
+- **Not** total P&L — that is the separate **PnL score** (21% of trading score).
+- **Not** volume — volume affects the **activity factor** multiplier on κ, not μ or LPM₃ directly.
+- **Not** per-tick P&L — only **realized** round-trip outcomes in the lookback window.
+- **Not** one global number at first — computed **per book**, then **median** across books (with outlier penalty for very weak books).
+
+#### Mining implications
+
+1. **μ:** Complete round-trips that are **slightly profitable on average** (completion legs with edge vs fill price).
+2. **LPM₃:** Avoid touch-chasing, taker churn, and inventory blowups that produce **large negative** realized samples — one bad −0.10 hurts more than many small wins help.
+3. **τ = 0:** Must be **net profitable on round-trips** in the window; breakeven or losing average μ caps κ regardless of low volatility.
+4. **Data requirement:** Need **≥ 3 non-zero** round-trip P&L samples per book — cold-book sweeps and consistent quoting exist partly to populate μ and LPM₃ with data, not just for volume.
+
+The agent table `kappa` field is the **aggregated, normalized** result of the full pipeline below (median across books, activity weighting, penalty) — not the raw per-book K₃(τ) alone.
+
 **Per-book calculation → median aggregation** across books with outlier penalty.
 
 #### Kappa scoring pipeline

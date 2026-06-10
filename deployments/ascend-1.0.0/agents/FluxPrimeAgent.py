@@ -16,10 +16,10 @@ from validator_exchange_log import ValidatorExchangeLogger
 
 
 class FluxPrimeAgent(AscendAgent):
-    """UID 209 — immunity test: kappa blitz (completion + cold-book sweep)."""
+    """UID 209 — ascend rocket engine (same path as UIDs 10/65)."""
 
     agent_label = "FluxPrimeAgent"
-    default_ascend_profile = "blitz"
+    default_ascend_profile = "rocket"
 
     def initialize(self) -> None:
         super().initialize()

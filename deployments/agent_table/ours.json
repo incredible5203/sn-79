@@ -21,7 +21,7 @@
     },
     {
       "agent_id": "209",
-      "label": "deploy-flux-2.1.0-blitz-cov",
+      "label": "deploy-flux-3.0.0-rocket",
       "deployment": "ascend-1.0.0",
       "run_script": "run_deploy_ascend.sh"
     }
