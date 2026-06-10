@@ -14,6 +14,7 @@
 3. [Why are miner scores different from each other?](#3-why-are-miner-scores-different-from-each-other)
 4. [How does the validator estimate and score what miners send back?](#4-how-does-the-validator-estimate-and-score-what-miners-send-back)
 5. [How can we increase incentive score?](#5-how-can-we-increase-incentive-score)
+6. [Incentive calculation end-to-end, and how to grow it fast](#6-incentive-calculation-end-to-end-and-how-to-grow-it-fast)
 
 ---
 
@@ -414,6 +415,154 @@ See [doc/gentrx/miner_setup.md](./doc/gentrx/miner_setup.md).
 
 ---
 
+## 6. Incentive calculation end-to-end, and how to grow it fast
+
+This section ties together **what “incentive” actually is** on-chain and a **time-ordered sprint plan** for moving it up as quickly as the protocol allows. “Fast” here means sim-hours, not seconds — several layers of lookback and smoothing sit between a good fill and `metagraph.incentive`.
+
+### 6.1 One diagram: trade → incentive
+
+```
+Each tick (~1 sim second)
+    Miner instructions → simulator fills → FIFO realized PnL per book
+        ↓
+Every ~5 sim seconds (scoring.interval)
+    κ₃ per book (need ≥3 round-trips in lookback)
+    → activity factor (volume) → outlier penalty → median = KappaScore
+    → median daily PnL return = PnLScore
+    → TradingScore = 0.79 × KappaScore + 0.21 × PnLScore   [0, 1]
+        ↓
+Same round, all miners
+    Pareto sort-multiply on trading scores (rank compression — top miners get disproportionate share)
+        ↓
+Slow EMA (moving_average_alpha ≈ 0.0083 per scoring round)
+    self.scores[uid] ← α × pareto_reward + (1−α) × old_score
+        ↓
+Weight setting (periodic)
+    L1-normalize scores → trading pool (~95%) + optional GenTRX pool (~5%)
+    → process_weights_for_netuid → set_weights on chain
+        ↓
+Metagraph
+    incentive[uid]  (your emission share on subnet 79)
+```
+
+**Key insight:** Incentive is **not** your last tick’s PnL. It is a **rank-weighted, EMA-smoothed share** of a pool that itself is built from **hours** of per-book median κ and PnL.
+
+### 6.2 The formulas (defaults, τaos 0.4.5)
+
+| Stage | Formula / rule | Typical value |
+|-------|----------------|---------------|
+| **Per-book κ₃** | (μ − τ) / LPM₃(τ)^(1/3) on realized-PnL time series | τ = 0; needs **≥ 3** non-zero RT observations |
+| **Kappa lookback** | Window of realized PnL samples | **1.5–3 sim hours** (`min_lookback` / `lookback`) |
+| **Activity factor** | Scales κ up when round-trip volume is healthy; decays when idle | Capped by `capital_turnover_cap` per book |
+| **Outlier penalty** | Books far below median (1.5× IQR) → subtract up to ~67% of gap | Dashboard **Penalty** column |
+| **KappaScore** | `max(median(activity_weighted_κ) − penalty, 0)` | [0, 1] |
+| **PnLScore** | Median daily return vs `miner_wealth / book_count` | ~[−0.5, +0.5] → blended at 21% |
+| **TradingScore** | `0.79 × KappaScore + 0.21 × PnLScore` | [0, 1] |
+| **Pareto layer** | Sorted trading scores × random Pareto weights | Rewards **relative rank**, not absolute score |
+| **Score EMA** | `scores ← α × reward + (1−α) × scores` | α ≈ **0.0083** → many scoring rounds to fully reflect a step change |
+| **On-chain weight** | Normalized EMA scores → two-pool split → uint16 weights | Multi-validator **consensus** lags single dashboard |
+
+GenTRX (optional): separate rank-normalized gradient score with its own EMA; does not replace trading score when the pool is small.
+
+### 6.3 Why incentive lags the dashboard
+
+| Layer | What you feel | Rough sim-time |
+|-------|----------------|----------------|
+| Fill → realized PnL | Immediate in next tick’s `notices` | **1 tick** |
+| κ appears per book | After 3+ completed round-trips in window | **~30–90 min** of active quoting |
+| KappaScore / TradingScore stable | Lookback fills with good trips | **2–6 sim hours** |
+| Penalty → 0 | Weak books stopped or fixed | **6–12 sim hours** |
+| EMA `scores` catch up | Pareto reward averaged in | **6–24 sim hours** after score step-up |
+| `metagraph.incentive` | Weight commits + multi-validator EMA | **Hours** after dashboard rank rises |
+
+You cannot skip the lookback or the EMA. You **can** shorten the path by maximizing **fill rate × profitable completions** from hour 0 so the lookback window fills with **good** data instead of losses.
+
+### 6.4 Fast-growth sprint (ordered by impact)
+
+Use this as a checklist after deploy or a strategy change. Each step targets the **earliest bottleneck** in §6.1.
+
+#### Phase A — First 30 sim minutes (infrastructure + data)
+
+| # | Action | Unlocks |
+|---|--------|---------|
+| A1 | Respond **&lt; 1 s** every tick; `lazy_load=1`; no heavy logging | Avoid 3 s timeout (= zero instructions, zero score data) |
+| A2 | Fix rejects: `qty ≥ 0.32`, loan headroom, ≤5 instr/book | Fills → FIFO PnL ledger |
+| A3 | **Cancel stale** every tick before new quotes | Frees budget; avoids adverse pick-off |
+| A4 | **Never return empty ticks** — bootstrap quote on cold books if needed | Continuous RT volume → activity factor |
+
+#### Phase B — 30 min – 3 sim hours (κ observations)
+
+| # | Action | Unlocks |
+|---|--------|---------|
+| B1 | **Touch-join** at bid/ask (maker, `postOnly`) on rotated books | Fill rate — top miners run **high RT volume** at the touch |
+| B2 | **Complete** every maker fill with opposite limit **inside** spread; require edge vs fill price | Closed round-trips → κ inputs + realized PnL |
+| B3 | **Rotate** across **128 books** (e.g. 10–11 books/tick, bucket every few ticks) | Median κ needs breadth; ≤37.5% inactive books allowed |
+| B4 | **Flatten inventory** when skew exceeds soft threshold | Lean BASE (~5k vs ~10k) — less completion bleed |
+
+#### Phase C — 3–12 sim hours (score + rank)
+
+| # | Action | Unlocks |
+|---|--------|---------|
+| C1 | **Stop losing books** — drop books with persistent negative realized PnL | **Penalty → 0** (big κ multiplier) |
+| C2 | Prefer **wide spread + inside quote** over touch-crossing / taker churn | Positive κ₃ (LPM₃ punishes downside) + PnLScore |
+| C3 | Steady volume **below** per-book cap | Activity factor high without cap freeze |
+| C4 | Hold strategy **stable** — no daily param whipsaw | Lookback window not polluted by mixed regimes |
+
+#### Phase D — 12+ sim hours (incentive on chain)
+
+| # | Action | Unlocks |
+|---|--------|---------|
+| D1 | Confirm dashboard: **Trading Score ↑**, **Pos** (rank) ↑, **Penalty ≈ 0** | Preconditions for weight share |
+| D2 | Watch `btcli subnet metagraph --netuid 79` **IN** column | On-chain incentive (lags dashboard) |
+| D3 | Compare agent table snapshots: `score`, `kappa`, `total_realized_pnl` trending up | Validates sprint before EMA catches up |
+
+### 6.5 What top miners do differently (observable patterns)
+
+From competitive agent-table snapshots, miners at **Pos 0–5** tend to share:
+
+| Pattern | Weak miner symptom | Strong miner symptom |
+|---------|-------------------|----------------------|
+| **Fill rate** | Low RT volume, many unfilled inside limits | **High RT volume** (touch-join at bid/ask) |
+| **Inventory** | BASE stuck ~10k+, skewed completions | **Lean BASE** ~4–7k, active flatten |
+| **κ** | `None` or negative | **κ ≈ 0.8–1.0**, Penalty **0** |
+| **Realized PnL** | Flat or falling despite volume | **Rising** with volume |
+| **Book coverage** | 2–3 books only | **Rotation** across many books per hour |
+
+**Anti-patterns that look “active” but kill short-term incentive:**
+
+- Quoting **only inside** spread on wide books → almost no fills → κ stays `None`
+- High volume **without** completion edge → negative realized PnL → κ crushed
+- Winning on 20 books, bleeding on 10 → **Penalty &gt; 0** drags median κ
+- Restarting strategy every hour → lookback never stabilizes → EMA never ramps
+
+### 6.6 Minimal metrics to watch (sprint dashboard)
+
+Check every 1–2 sim hours during a growth sprint:
+
+```
+□ Requests/timeouts     → should be ~0 timeouts
+□ RT volume             → should climb toward top-quartile miners
+□ Kappa                 → not None; trending positive
+□ Penalty               → target 0
+□ Realized PnL          → flat or up (not down with rising volume)
+□ Trading Score + Pos   → up before expecting incentive ↑
+□ metagraph.incentive   → lags; only trust after score stable 6+ hours
+```
+
+### 6.7 Repo-aligned defaults (Ascend / Flux family)
+
+Our competitive deploy agents (`ascend_score_tick`, profiles `prime` / `surge` / `forge` / `flux`) encode the sprint above:
+
+- Touch-join phase + fill-score ranking for **Phase B1**
+- Completion legs with `min_rt_edge_ticks` for **B2**
+- 10–11 books/tick, 12-bucket rotation for **B3**
+- Inventory skew soft/hard + flatten budget for **B4**
+- Cold-book bootstrap so ticks are never empty for **A4**
+
+Tuning wider spreads or fewer books trades **speed of κ data** for **PnL safety** — for fastest *incentive* growth, prioritize **profitable round-trips at the touch** over raw instruction count.
+
+---
+
 ## Quick reference
 
 ```
@@ -425,4 +574,4 @@ INCENTIVE: TradingScore (+ GenTRX) → EMA → weights → metagraph.incentive
 
 ---
 
-*Document version: 2026-06-09 · τaos 0.4.5 · SN-79 mainnet netuid 79*
+*Document version: 2026-06-10 · τaos 0.4.5 · SN-79 mainnet netuid 79*

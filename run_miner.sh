@@ -77,6 +77,8 @@ if [ -n "$DEPLOY_DIR" ]; then
     # shellcheck disable=SC1091
     . "$DEPLOY_DIR/miner.env"
     set +a
+    export BT_NO_PARSE_CLI_ARGS="${BT_NO_PARSE_CLI_ARGS:-false}"
+    export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
     AGENT_PATH="$DEPLOY_DIR/agents"
     if [ -f "$DEPLOY_DIR/.env" ]; then
         set -a
@@ -474,7 +476,12 @@ print(m.group(1) if m else '')
     tmux attach-session -t miner
 else
     pm2 delete "$PM2_NAME" 2>/dev/null || true
-    pm2 start miner.py \
+    if [ -n "${PRE_DELETE_PM2_NAMES:-}" ]; then
+        for _legacy in $PRE_DELETE_PM2_NAMES; do
+            pm2 delete "$_legacy" 2>/dev/null || true
+        done
+    fi
+    PYTHONUNBUFFERED=1 pm2 start miner.py \
         --name="$PM2_NAME" \
         --interpreter python \
         --cwd "$REPO_ROOT/taos/im/neurons" \
