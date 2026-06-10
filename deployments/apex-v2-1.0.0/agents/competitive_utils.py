@@ -1606,6 +1606,7 @@ def ascend_score_tick(
     max_flatten_per_tick: int = 12,
     touch_join_spread_ticks: float = 4.5,
     max_touch_per_tick: int = 8,
+    max_cold_books_per_tick: int = 4,
 ) -> None:
     """
     Ascend scoring engine — fast κ growth, Penalty → 0, positive realized PnL.
@@ -1839,7 +1840,7 @@ def ascend_score_tick(
         if spread_ticks < touch_join_spread_ticks:
             continue
         rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
-        if rt_edge < quote_rt_edge:
+        if rt_edge < quote_rt_edge or rt_edge < completion_edge:
             continue
         skew = inventory_skew(accounts, book_id, mid)
         touch_skew_cap = inventory_skew_soft * (0.5 if not risk_off else 0.35)
@@ -2041,9 +2042,15 @@ def ascend_score_tick(
             )
         else:
             continue
+        rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
         quote_mode = (
             "join_touch"
-            if spread_ticks >= touch_join_spread_ticks and abs(skew) < inventory_skew_soft * 0.4
+            if (
+                spread_ticks >= touch_join_spread_ticks
+                and rt_edge >= completion_edge
+                and abs(skew) < inventory_skew_soft * 0.4
+                and not risk_off
+            )
             else "inside"
         )
         price = _limit_price(
@@ -2068,6 +2075,74 @@ def ascend_score_tick(
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
+    cold_count = 0
+    if max_cold_books_per_tick > 0 and budget.total < max_total_instructions:
+        cold_jobs: list[tuple[float, int, Book, float, float, float]] = []
+        for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
+            if book_id in placed or _has_loan(accounts, book_id):
+                continue
+            traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
+            if traded >= cold_book_volume_threshold:
+                continue
+            spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+            if spread_ticks < min_spread_ticks:
+                continue
+            if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
+                continue
+            skew = inventory_skew(accounts, book_id, mid)
+            if abs(skew) >= inventory_skew_soft:
+                continue
+            cold_jobs.append((traded, book_id, book, best_bid, best_ask, mid))
+        cold_jobs.sort(key=lambda x: x[0])
+        for _traded, book_id, book, best_bid, best_ask, mid in cold_jobs:
+            if cold_count >= max_cold_books_per_tick or budget.total >= max_total_instructions:
+                break
+            if book_id in placed:
+                continue
+            spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+            depth = base_depth + 1 if spread_ticks >= deep_spread_ticks else base_depth
+            account = accounts[book_id]
+            mp = microprice(book)
+            if mp is not None and tick > 0:
+                edge_ticks = (mp - mid) / tick
+                if edge_ticks >= min_microprice_edge_ticks:
+                    trade_dir = OrderDirection.BUY
+                elif edge_ticks <= -min_microprice_edge_ticks:
+                    trade_dir = OrderDirection.SELL
+                else:
+                    trade_dir = (
+                        OrderDirection.BUY
+                        if (book_id + rot) % 2 == 0
+                        else OrderDirection.SELL
+                    )
+            else:
+                trade_dir = (
+                    OrderDirection.BUY
+                    if (book_id + rot) % 2 == 0
+                    else OrderDirection.SELL
+                )
+            price = _limit_price(
+                trade_dir, best_bid, best_ask, tick, pdec,
+                mode="inside", depth_ticks=depth,
+            )
+            if trade_dir == OrderDirection.BUY:
+                if price >= best_ask or account.quote_balance.free < qty * price:
+                    continue
+            elif price <= best_bid or account.base_balance.free < qty:
+                continue
+            if not budget.can_place(book_id, 1):
+                continue
+            place_limit(
+                response, book_id, trade_dir, qty, price, expiry_period,
+                volume_decimals=vdec, min_quantity=min_quantity,
+            )
+            budget.mark(book_id, 1)
+            placed.add(book_id)
+            cold_count += 1
+            direction[book_id] = (
+                OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
+            )
+
     if not response.instructions:
         bootstrap_jobs: list[tuple[float, int, Book, float, float, float]] = []
         for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
@@ -2080,7 +2155,10 @@ def ascend_score_tick(
                 continue
             bootstrap_jobs.append((spread_ticks, book_id, book, best_bid, best_ask, mid))
         bootstrap_jobs.sort(key=lambda x: -x[0])
+        bootstrap_placed = 0
         for spread_ticks, book_id, book, best_bid, best_ask, mid in bootstrap_jobs:
+            if bootstrap_placed >= 3:
+                break
             skew = inventory_skew(accounts, book_id, mid)
             if skew > inventory_skew_soft * 0.35:
                 trade_dir = OrderDirection.SELL
@@ -2109,7 +2187,7 @@ def ascend_score_tick(
             rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
             if (
                 spread_ticks >= touch_join_spread_ticks
-                and rt_edge >= min_rt_edge_ticks
+                and rt_edge >= completion_edge
                 and abs(skew) < inventory_skew_soft * 0.5
             ):
                 mode = "join_touch"
@@ -2132,10 +2210,11 @@ def ascend_score_tick(
                 response, book_id, trade_dir, qty, price, expiry_period,
                 volume_decimals=vdec, min_quantity=min_quantity,
             )
+            budget.mark(book_id, 1)
             direction[book_id] = (
                 OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
             )
-            break
+            bootstrap_placed += 1
 
 
 def turbo_power_score_tick(
