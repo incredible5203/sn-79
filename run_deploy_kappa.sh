@@ -1,5 +1,5 @@
 #!/bin/bash
-# AscendKappaAgent — frozen deployment bundle
+# UID 196 — AscendPulseAgent (UID 65 engine, tweaked params)
 # 1. Edit deployments/kappa-1.0.0/miner.env (PM2_NAME, UID, wallet, port)
 # 2. ./run_deploy_kappa.sh
 set -e
