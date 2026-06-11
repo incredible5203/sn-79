@@ -1,5 +1,5 @@
 #!/bin/bash
-# UID 196 — HybridRealizedAgent (Ascend engine, realized profile)
+# UID 196 — AscendPulseAgent rocket (UID 65 parity)
 # 1. Edit deployments/hybrid-1.0.0/miner.env (PM2_NAME, UID, wallet, port)
 # 2. ./run_deploy_hybrid.sh
 set -e

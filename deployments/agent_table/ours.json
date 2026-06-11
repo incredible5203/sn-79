@@ -21,10 +21,10 @@
     },
     {
       "agent_id": "196",
-      "label": "deploy-hybrid-3.0",
+      "label": "deploy-hybrid-4.0",
       "deployment": "hybrid-1.0.0",
       "run_script": "run_deploy_hybrid.sh",
-      "note": "HybridRealizedAgent (Ascend engine, realized profile — completion-first RTs)"
+      "note": "AscendPulseAgent rocket (UID 65 parity); cancel_all on startup for PnL recovery"
     }
   ]
 }

@@ -1,13 +1,1 @@
-release_id=hybrid-3.0.0
-agent=HybridResilientAgent
-engine=ascend_score_tick.py (ScoreTickEngine)
-books=86-127
-uid=196
-hotkey=hot4
-pm2=79-hybrid
-git_commit=local
-bundled_at=2026-06-11T00:00:00Z
-files:
-  HybridResilientAgent.py
-  ascend_score_tick.py
-  _sn79_compat.py
+release_id=hybrid-4.0.0
