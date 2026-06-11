@@ -83,6 +83,7 @@ import os
 import sys
 import time
 import logging
+import bittensor as bt
 from collections import defaultdict, deque
 from typing import Optional, Tuple
 
@@ -90,7 +91,7 @@ _agent_dir = os.path.dirname(os.path.abspath(__file__))
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from _sn79_compat import CompatFinanceAgentResponse, is_trade_notice, unwrap_response
+from _sn79_compat import CompatFinanceAgentResponse, is_trade_notice, log_agent_tick, unwrap_response
 
 logger = logging.getLogger(__name__)
 
@@ -393,12 +394,14 @@ class HybridResilientAgent:
             self.update(state)
             response = self.respond(state)
         except Exception as e:
-            logger.error(f"HybridResilientAgent error: {e}", exc_info=True)
+            bt.logging.error(f"HybridResilientAgent error: {e}")
             response = self._make_response()
         elapsed = time.time() - t0
         if elapsed > 2.0:
-            logger.warning(f"Slow tick: {elapsed:.2f}s (timeout ~3s)")
-        return unwrap_response(response)
+            bt.logging.warning(f"Slow tick: {elapsed:.2f}s (timeout ~3s)")
+        inner = unwrap_response(response)
+        log_agent_tick(self.uid, self.events, inner)
+        return inner
 
     def update(self, state):
         self.config    = state.config

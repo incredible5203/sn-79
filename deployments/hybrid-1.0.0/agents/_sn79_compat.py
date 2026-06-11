@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import bittensor as bt
+
 from taos.im.protocol.instructions import OrderDirection, TimeInForce
 from taos.im.protocol.response import FinanceAgentResponse
 
@@ -125,3 +127,42 @@ def unwrap_response(response):
     """Return the protocol FinanceAgentResponse expected by the validator synapse."""
     inner = getattr(response, "_inner", None)
     return inner if inner is not None else response
+
+
+def log_agent_tick(uid: int, events, response) -> None:
+    """Emit bt.logging output like FinanceSimulationAgent report/update."""
+    if bt.logging.current_state_value != "Info":
+        return
+
+    trade_lines: list[str] = []
+    for notice in events or []:
+        if not is_trade_notice(notice):
+            continue
+        maker_id = getattr(notice, "makerAgentId", None)
+        taker_id = getattr(notice, "takerAgentId", None)
+        if uid not in (maker_id, taker_id):
+            continue
+        role = "PASSIVE" if uid == maker_id else "AGGRESSIVE"
+        side = "BUY" if getattr(notice, "side", 1) == 0 else "SELL"
+        book_id = getattr(notice, "bookId", "?")
+        price = getattr(notice, "price", 0.0)
+        qty = getattr(notice, "quantity", 0.0)
+        trade_lines.append(
+            f"BOOK {book_id} : {side} TRADE : YOUR {role} FILL {qty}@{price}"
+        )
+
+    instructions = getattr(response, "instructions", None) or []
+    if not trade_lines and not instructions:
+        return
+
+    text = "-" * 50 + "\n"
+    if trade_lines:
+        text += "EVENTS\n" + "-" * 50 + "\n"
+        text += "\n".join(trade_lines) + "\n"
+    text += "INSTRUCTIONS\n" + "-" * 50 + "\n"
+    if instructions:
+        text += "\n".join(str(i) for i in instructions) + "\n"
+    else:
+        text += "NO INSTRUCTIONS TO SUBMIT\n"
+    text += "-" * 50
+    bt.logging.info(".\n" + text)
