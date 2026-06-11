@@ -61,18 +61,19 @@ from ascend_score_tick import ScoreTickEngine, LaneProfile
 
 logger = logging.getLogger(__name__)
 
-BOOK_RANGE = range(86, 128)
+# Single UID 196: cover all 128 books (kappa+micro lanes inactive).
+BOOK_RANGE = range(0, 128)
 
 PROFILE = LaneProfile(
-    presence_qty=0.6,
-    alpha_qty=0.6,
+    presence_qty=0.32,
+    alpha_qty=0.32,
     alpha_enabled=True,
-    min_spread_ticks_alpha=3.5,
-    max_spread_ratio_alpha=0.0030,
-    ofi_threshold=0.13,
+    min_spread_ticks_alpha=4.0,
+    max_spread_ratio_alpha=0.0025,
+    ofi_threshold=0.15,
     ofi_window_ticks=4,
-    alpha_books_per_tick=8,
-    presence_max_per_tick=12,
+    alpha_books_per_tick=10,
+    presence_max_per_tick=13,
 )
 
 

@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 # GLOBAL TUNABLES (shared across all 3 agents)
 # ─────────────────────────────────────────────────────────────────────────────
 
-GRACE_PERIOD_SECONDS      = 620
+GRACE_PERIOD_SECONDS      = 0
 
 # --- Fee-aware round trip economics (THE CORE FIX) ---
 # Required edge = (maker_fee_rate + maker_fee_rate) * price * (1 + PROFIT_MARGIN)
@@ -82,26 +82,24 @@ GRACE_PERIOD_SECONDS      = 620
 # plus an additional profit margin on top, plus a small fixed tick
 # buffer for rounding safety.
 ROUNDTRIP_FEE_LEGS        = 2        # both entry and exit assumed maker
-PROFIT_MARGIN_BPS         = 3.0      # extra profit required ON TOP of fees
-EXTRA_EDGE_TICKS          = 1        # small fixed buffer in price ticks
+PROFIT_MARGIN_BPS         = 5.0      # extra profit required ON TOP of fees
+EXTRA_EDGE_TICKS          = 2        # small fixed buffer in price ticks
 FALLBACK_MAKER_FEE        = 0.0005   # used if account.fees unavailable (5bps)
 MAX_REASONABLE_FEE        = 0.01     # sanity clamp (1%) -- ignore garbage fee reads
+ORDER_EXPIRY_NS           = 180_000_000_000  # GTT 180 sim-seconds
+MIN_PRESENCE_SPREAD_TICKS = 3.0      # skip tight books that cannot cover fees
 
 # --- Round trip / kappa-penalty floor ---
 MIN_ROUNDTRIPS_FOR_KAPPA  = 3         # validator needs >=3 RTs/book in window
 KAPPA_LOOKBACK_TICKS      = 1800      # ~30 sim-min @ 1s/tick; conservative window
 PRESENCE_FORCE_RATIO      = 0.6       # if RT count in window < this*MIN -> force
 
-# --- Round trip stuck / escape valve ---
-COMPLETION_STUCK_TICKS    = 120       # after this many ticks, unwind passively
-                                       # at touch even if edge not met (still
-                                       # post_only, still better than nothing,
-                                       # but logged loudly as a near-miss)
-HARD_STUCK_TICKS          = 400       # after this, allow a SINGLE tick of
-                                       # crossing (taker) unwind to avoid
-                                       # infinite inventory growth -- this is
-                                       # the ONLY place a taker order is ever
-                                       # used, and only as a last resort.
+# --- Round trip stuck handling (v2.1: NO loss completions) ---
+# Previously stuck/hard-stuck paths forced touch/taker unwinds without
+# fee-aware edge — that reproduced the -3..-15bps realized-PnL bleed.
+# Inventory may sit until the market offers required_edge; never realize a loss.
+COMPLETION_STUCK_TICKS    = 10_000    # diagnostic counter only
+HARD_STUCK_TICKS          = 10_000    # disabled — no taker escape
 
 MIN_QUANTITY              = 0.25
 
@@ -261,6 +259,33 @@ def required_edge(price: float, account, config, tick: float) -> float:
     # multiplier on fee_cost (clearer to tune). Recompute directly:
     margin = price * (PROFIT_MARGIN_BPS / 10000.0)
     return fee_cost + margin + EXTRA_EDGE_TICKS * tick
+
+
+def spread_covers_edge(
+    bid: float, ask: float, account, config, tick: float
+) -> bool:
+    """Book spread must be wide enough to complete a fee-positive round trip."""
+    if bid is None or ask is None or ask <= bid:
+        return False
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return False
+    edge = required_edge(mid, account, config, tick)
+    return (ask - bid) >= edge * 0.95
+
+
+def place_passive_gtt(
+    response, book_id, direction: str, qty: float, price: float, *, post_only: bool = True
+) -> None:
+    response.limit_order(
+        book_id=book_id,
+        direction=direction,
+        quantity=qty,
+        price=price,
+        post_only=post_only,
+        time_in_force="GTT",
+        expiry_period=ORDER_EXPIRY_NS,
+    )
 
 
 def compute_ofi(book) -> float:
@@ -685,91 +710,50 @@ class ScoreTickEngine:
             slot = self._slots[book_id]
             qty = round_qty(max(abs(ledger.net_qty), MIN_QUANTITY), config)
 
-            stuck      = slot.completion_attempts >= COMPLETION_STUCK_TICKS
-            hard_stuck = slot.completion_attempts >= HARD_STUCK_TICKS
-
             try:
                 if ledger.net_qty > 0:
-                    # Net long -> SELL to close.
+                    # Net long -> SELL to close only when touch covers fees+margin.
                     edge = required_edge(ask, account, config, tick)
                     required_min = ledger.avg_cost + edge
 
-                    if ask >= required_min - 1e-12:
-                        price = round_price(max(ask, required_min), config)
-                        post_only = True
-                    elif hard_stuck:
-                        # LAST RESORT: cross to unwind. Still try to
-                        # minimize damage by pricing at bid (best
-                        # available), single tick of crossing only.
-                        price = round_price(bid, config)
-                        post_only = False
-                        logger.warning(
-                            f"{self.agent_name}: HARD-STUCK unwind (taker) "
-                            f"SELL book {book_id} qty={qty}@{price} "
-                            f"(cost={ledger.avg_cost:.4f}, required_edge={edge:.5f})")
-                    elif stuck:
-                        price = round_price(ask, config)
-                        post_only = True
-                    else:
+                    if ask < required_min - 1e-12:
                         slot.completion_attempts += 1
                         continue
 
+                    price = round_price(max(ask, required_min), config)
                     sell_qty = min(qty, account.base_balance.free)
                     sell_qty = round_qty(sell_qty, config)
                     if sell_qty < MIN_QUANTITY:
                         continue
 
-                    response.limit_order(
-                        book_id=book_id, direction='SELL',
-                        quantity=sell_qty, price=price,
-                        post_only=post_only, time_in_force='GTC')
+                    place_passive_gtt(
+                        response, book_id, "SELL", sell_qty, price, post_only=True)
                     budget.use(book_id)
-                    if not (stuck or hard_stuck):
-                        slot.completion_attempts = 0
-                    else:
-                        slot.completion_attempts += 1
+                    slot.completion_attempts = 0
                     logger.debug(f"{self.agent_name}: COMPLETE SELL {sell_qty}@{price} "
                                   f"BOOK {book_id} (cost={ledger.avg_cost:.4f}, edge={edge:.5f})")
 
                 else:
-                    # Net short -> BUY to close.
+                    # Net short -> BUY to close only when touch covers fees+margin.
                     edge = required_edge(bid, account, config, tick)
                     required_max = ledger.avg_cost - edge
 
-                    if bid <= required_max + 1e-12:
-                        price = round_price(min(bid, required_max), config)
-                        post_only = True
-                    elif hard_stuck:
-                        price = round_price(ask, config)
-                        post_only = False
-                        logger.warning(
-                            f"{self.agent_name}: HARD-STUCK unwind (taker) "
-                            f"BUY book {book_id} qty={qty}@{price} "
-                            f"(cost={ledger.avg_cost:.4f}, required_edge={edge:.5f})")
-                    elif stuck:
-                        price = round_price(bid, config)
-                        post_only = True
-                    else:
+                    if bid > required_max + 1e-12:
                         slot.completion_attempts += 1
                         continue
 
-                    needed_quote = qty * price
+                    price = round_price(min(bid, required_max), config)
                     buy_qty = qty
-                    if account.quote_balance.free < needed_quote:
+                    if account.quote_balance.free < qty * price:
                         affordable = account.quote_balance.free / max(price, 1e-9)
                         buy_qty = round_qty(min(buy_qty, affordable), config)
                     if buy_qty < MIN_QUANTITY:
                         continue
 
-                    response.limit_order(
-                        book_id=book_id, direction='BUY',
-                        quantity=buy_qty, price=price,
-                        post_only=post_only, time_in_force='GTC')
+                    place_passive_gtt(
+                        response, book_id, "BUY", buy_qty, price, post_only=True)
                     budget.use(book_id)
-                    if not (stuck or hard_stuck):
-                        slot.completion_attempts = 0
-                    else:
-                        slot.completion_attempts += 1
+                    slot.completion_attempts = 0
                     logger.debug(f"{self.agent_name}: COMPLETE BUY {buy_qty}@{price} "
                                   f"BOOK {book_id} (cost={ledger.avg_cost:.4f}, edge={edge:.5f})")
 
@@ -781,6 +765,10 @@ class ScoreTickEngine:
     # ─────────────────────────────────────────────────────────────────────
 
     def _flatten_skew(self, state, response, budget: Budget, tick: float):
+        # Disabled: passive touch flatten without required_edge() was a
+        # secondary realized-PnL leak. Inventory is closed only via Phase 3.
+        return
+
         config = self.config
 
         for book_id, account in self.accounts.items():
@@ -880,15 +868,10 @@ class ScoreTickEngine:
                 continue
 
             spread_ticks = (ask - bid) / tick if tick > 0 else 0
-            if spread_ticks < 1:
+            if spread_ticks < MIN_PRESENCE_SPREAD_TICKS:
                 continue
-
-            # If this book is behind on its round-trip floor, prioritize
-            # it (place even if other heuristics would skip) -- this is
-            # what drives kappa_penalty -> 0.
-            recent_rts = sum(1 for t in slot.roundtrip_ticks
-                              if self._tick - t <= KAPPA_LOOKBACK_TICKS)
-            behind_floor = recent_rts < MIN_ROUNDTRIPS_FOR_KAPPA
+            if not spread_covers_edge(bid, ask, account, config, tick):
+                continue
 
             side = "BUY" if (book_id + self._tick) % 2 == 0 else "SELL"
             qty = round_qty(max(profile.presence_qty, MIN_QUANTITY), config)
@@ -901,13 +884,7 @@ class ScoreTickEngine:
                     price = round_price(bid, config)
                     needed = qty * price
                     if account.quote_balance.free < needed:
-                        if behind_floor:
-                            qty = round_qty(max(account.quote_balance.free / max(price, 1e-9),
-                                                MIN_QUANTITY), config)
-                            if qty < MIN_QUANTITY:
-                                continue
-                        else:
-                            continue
+                        continue
                 else:
                     price = round_price(ask, config)
 
@@ -915,10 +892,8 @@ class ScoreTickEngine:
                 if price in existing:
                     continue
 
-                response.limit_order(
-                    book_id=book_id, direction=side,
-                    quantity=qty, price=price,
-                    post_only=True, time_in_force='GTC')
+                place_passive_gtt(
+                    response, book_id, side, qty, price, post_only=True)
                 budget.use(book_id)
                 placed += 1
             except Exception as e:
@@ -959,6 +934,8 @@ class ScoreTickEngine:
             spread = ask - bid
             spread_ticks = spread / tick if tick > 0 else 0
             if spread_ticks < profile.min_spread_ticks_alpha:
+                continue
+            if not spread_covers_edge(bid, ask, account, config, tick):
                 continue
 
             mid = (bid + ask) / 2
@@ -1025,10 +1002,8 @@ class ScoreTickEngine:
                 if price in existing:
                     continue
 
-                response.limit_order(
-                    book_id=book_id, direction=direction,
-                    quantity=qty, price=price,
-                    post_only=True, time_in_force='GTC')
+                place_passive_gtt(
+                    response, book_id, direction, qty, price, post_only=True)
                 budget.use(book_id)
                 placed += 1
                 logger.debug(f"{self.agent_name}: ALPHA {direction} {qty}@{price} "
