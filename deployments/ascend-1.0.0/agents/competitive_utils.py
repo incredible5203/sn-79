@@ -2671,16 +2671,10 @@ def kappa_blitz_score_tick(
     min_microprice_edge_ticks: float = 1.0,
     min_quote_spread_ticks: float | None = None,
     min_quote_rt_edge_ticks: float | None = None,
-    min_cold_spread_ticks: float | None = None,
-    min_cold_rt_edge_ticks: float | None = None,
     max_tape_imbalance: float = 0.25,
     cold_book_volume_threshold: float = 5000.0,
     inside_depth_ticks: int = 1,
     use_fill_score_ranking: bool = True,
-    touch_join_spread_ticks: float = 0.0,
-    max_touch_per_tick: int = 0,
-    risk_off_skewed_books: int = 4,
-    max_flatten_per_tick: int = 8,
 ) -> None:
     """Immunity-period kappa blitz: completion-first + mandatory cold-book sweep."""
     requote_hints = requote_hints or {}
@@ -2698,16 +2692,6 @@ def kappa_blitz_score_tick(
         min_rt_edge_ticks
         if min_quote_rt_edge_ticks is None
         else min_quote_rt_edge_ticks
-    )
-    cold_spread_min = (
-        min_spread_ticks
-        if min_cold_spread_ticks is None
-        else min_cold_spread_ticks
-    )
-    cold_rt_edge = (
-        min_rt_edge_ticks
-        if min_cold_rt_edge_ticks is None
-        else min_cold_rt_edge_ticks
     )
     vdec = simulation_config.volumeDecimals
     pdec = simulation_config.priceDecimals
@@ -2753,14 +2737,6 @@ def kappa_blitz_score_tick(
 
     if not book_rows:
         return
-
-    pending_completion = set(requote_hints.keys())
-    skewed_count = sum(
-        1
-        for bid, (_b, _bb, _ba, mid) in book_rows.items()
-        if abs(inventory_skew(accounts, bid, mid)) >= inventory_skew_soft
-    )
-    risk_off = skewed_count >= risk_off_skewed_books
 
     placed: set[int] = set()
     for book_id, (_book, best_bid, best_ask, _mid) in sorted(book_rows.items()):
@@ -2825,12 +2801,8 @@ def kappa_blitz_score_tick(
         trade_dir = OrderDirection.SELL if skew > 0 else OrderDirection.BUY
         flatten_jobs.append((abs(skew) * 200.0, book_id, best_bid, best_ask, mid, trade_dir))
     flatten_jobs.sort(key=lambda x: -x[0])
-    flatten_count = 0
     for _prio, book_id, best_bid, best_ask, _mid, trade_dir in flatten_jobs:
-        if (
-            flatten_count >= max_flatten_per_tick
-            or budget.total >= max_total_instructions
-        ):
+        if budget.total >= max_total_instructions or len(placed) >= max_books_per_tick:
             break
         if book_id in placed:
             continue
@@ -2852,41 +2824,23 @@ def kappa_blitz_score_tick(
         )
         budget.mark(book_id, 1)
         placed.add(book_id)
-        flatten_count += 1
         direction[book_id] = (
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
 
-    if risk_off:
-        for book_id, (_book, best_bid, best_ask, _mid) in sorted(book_rows.items()):
-            if budget.total >= max_total_instructions:
-                break
-            if abs(inventory_skew(accounts, book_id, _mid)) < inventory_skew_soft:
-                continue
-            cancel_stale_orders(
-                response, accounts[book_id], book_id, best_bid, best_ask, tick, budget,
-                max_cancel=max_instructions_per_book,
-            )
-
     cold_jobs: list[tuple[float, int, Book, float, float, float]] = []
-    if not risk_off:
-        for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
-            if book_id in placed or book_id in pending_completion or _has_loan(accounts, book_id):
-                continue
-            traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
-            if traded >= cold_book_volume_threshold:
-                continue
-            skew = inventory_skew(accounts, book_id, mid)
-            if abs(skew) >= inventory_skew_soft:
-                continue
-            if traded > 0 and abs(skew) >= inventory_skew_soft * 0.25:
-                continue
-            spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-            eff_spread = cold_spread_min if traded > 0 else min(cold_spread_min, 4.0)
-            eff_rt = cold_rt_edge if traded > 0 else min(cold_rt_edge, 4.0)
-            if spread_ticks < eff_spread or _rt_edge_ticks(best_bid, best_ask, tick, pdec) < eff_rt:
-                continue
-            cold_jobs.append((traded, book_id, book, best_bid, best_ask, mid))
+    for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
+        if book_id in placed or _has_loan(accounts, book_id):
+            continue
+        traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
+        if traded >= cold_book_volume_threshold:
+            continue
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < quote_spread_min or _rt_edge_ticks(best_bid, best_ask, tick, pdec) < quote_rt_edge:
+            continue
+        if abs(inventory_skew(accounts, book_id, mid)) >= inventory_skew_soft:
+            continue
+        cold_jobs.append((traded, book_id, book, best_bid, best_ask, mid))
     cold_jobs.sort(key=lambda x: x[0])
     cold_count = 0
     for _traded, book_id, book, best_bid, best_ask, mid in cold_jobs:
@@ -2933,24 +2887,23 @@ def kappa_blitz_score_tick(
         )
 
     quote_candidates: list[tuple[float, int, Book, float, float, float]] = []
-    if not risk_off:
-        for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
-            if book_id in placed or book_id in pending_completion or _has_loan(accounts, book_id):
-                continue
-            if (book_id % book_rotation_groups) not in active_rots:
-                continue
-            if abs(inventory_skew(accounts, book_id, mid)) >= inventory_skew_soft:
-                continue
-            spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-            if spread_ticks < quote_spread_min or _rt_edge_ticks(best_bid, best_ask, tick, pdec) < quote_rt_edge:
-                continue
-            traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
-            cold_bonus = 3.0 if traded < cold_book_volume_threshold * 0.2 else 0.0
-            rank = (
-                book_fill_score(book, accounts, book_id, spread_ticks=spread_ticks) + cold_bonus
-                if use_fill_score_ranking else spread_ticks + cold_bonus
-            )
-            quote_candidates.append((rank, book_id, book, best_bid, best_ask, mid))
+    for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
+        if book_id in placed or _has_loan(accounts, book_id):
+            continue
+        if (book_id % book_rotation_groups) not in active_rots:
+            continue
+        if abs(inventory_skew(accounts, book_id, mid)) >= inventory_skew_soft:
+            continue
+        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
+        if spread_ticks < quote_spread_min or _rt_edge_ticks(best_bid, best_ask, tick, pdec) < quote_rt_edge:
+            continue
+        traded = float(getattr(accounts[book_id], "traded_volume", 0.0) or 0.0)
+        cold_bonus = 3.0 if traded < cold_book_volume_threshold * 0.2 else 0.0
+        rank = (
+            book_fill_score(book, accounts, book_id, spread_ticks=spread_ticks) + cold_bonus
+            if use_fill_score_ranking else spread_ticks + cold_bonus
+        )
+        quote_candidates.append((rank, book_id, book, best_bid, best_ask, mid))
     quote_candidates.sort(key=lambda x: -x[0])
 
     quote_count = 0
@@ -2997,70 +2950,4 @@ def kappa_blitz_score_tick(
         direction[book_id] = (
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
-
-    if max_touch_per_tick > 0 and touch_join_spread_ticks > 0 and not risk_off:
-        touch_jobs: list[tuple[float, int, Book, float, float, float]] = []
-        for book_id, (book, best_bid, best_ask, mid) in book_rows.items():
-            if book_id in placed or _has_loan(accounts, book_id):
-                continue
-            if (book_id % book_rotation_groups) not in active_rots:
-                continue
-            spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-            if spread_ticks < touch_join_spread_ticks:
-                continue
-            rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
-            if rt_edge < quote_rt_edge or rt_edge < completion_edge:
-                continue
-            if abs(inventory_skew(accounts, book_id, mid)) >= inventory_skew_soft * 0.5:
-                continue
-            rank = book_fill_score(book, accounts, book_id, spread_ticks=spread_ticks)
-            touch_jobs.append((rank + spread_ticks * 0.5, book_id, book, best_bid, best_ask, mid))
-        touch_jobs.sort(key=lambda x: -x[0])
-        touch_count = 0
-        for _rank, book_id, book, best_bid, best_ask, mid in touch_jobs:
-            if touch_count >= max_touch_per_tick or budget.total >= max_total_instructions:
-                break
-            if book_id in placed:
-                continue
-            skew = inventory_skew(accounts, book_id, mid)
-            mp = microprice(book)
-            if skew > 0.003:
-                trade_dir = OrderDirection.SELL
-            elif skew < -0.003:
-                trade_dir = OrderDirection.BUY
-            elif mp is not None and tick > 0:
-                edge_ticks = (mp - mid) / tick
-                if edge_ticks >= min_microprice_edge_ticks:
-                    trade_dir = OrderDirection.BUY
-                elif edge_ticks <= -min_microprice_edge_ticks:
-                    trade_dir = OrderDirection.SELL
-                else:
-                    trade_dir = (
-                        OrderDirection.BUY if (book_id + rot) % 2 == 0 else OrderDirection.SELL
-                    )
-            else:
-                trade_dir = (
-                    OrderDirection.BUY if (book_id + rot) % 2 == 0 else OrderDirection.SELL
-                )
-            price = _limit_price(
-                trade_dir, best_bid, best_ask, tick, pdec, mode="join_touch",
-            )
-            account = accounts[book_id]
-            if trade_dir == OrderDirection.BUY:
-                if price >= best_ask or account.quote_balance.free < qty * price:
-                    continue
-            elif price <= best_bid or account.base_balance.free < qty:
-                continue
-            if not budget.can_place(book_id, 1):
-                continue
-            place_limit(
-                response, book_id, trade_dir, qty, price, expiry_period,
-                volume_decimals=vdec, min_quantity=min_quantity,
-            )
-            budget.mark(book_id, 1)
-            placed.add(book_id)
-            touch_count += 1
-            direction[book_id] = (
-                OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
-            )
 
