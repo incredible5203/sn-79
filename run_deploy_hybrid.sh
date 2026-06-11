@@ -1,5 +1,5 @@
 #!/bin/bash
-# UID 196 — HybridResilientAgent v2 (books 86-127, fee-aware engine)
+# UID 196 — HybridRealizedAgent (Ascend engine, realized profile)
 # 1. Edit deployments/hybrid-1.0.0/miner.env (PM2_NAME, UID, wallet, port)
 # 2. ./run_deploy_hybrid.sh
 set -e

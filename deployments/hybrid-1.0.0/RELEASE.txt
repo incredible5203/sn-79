@@ -1,4 +1,4 @@
-release_id=hybrid-2.1.0
+release_id=hybrid-3.0.0
 agent=HybridResilientAgent
 engine=ascend_score_tick.py (ScoreTickEngine)
 books=86-127
