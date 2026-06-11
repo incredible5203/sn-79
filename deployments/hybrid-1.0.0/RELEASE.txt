@@ -1,8 +1,8 @@
-release_id=hybrid-1.0.1
+release_id=hybrid-1.0.2
 agent=HybridResilientAgent
 git_commit=local
 bundled_at=2026-06-11T00:00:00Z
-notes=completion touch-join fix, tuned params, removed OFI skew override
+notes=no-loss-only completions, GTT expiry, ledger bootstrap, inventory-aware presence
 files:
   HybridResilientAgent.py
   _sn79_compat.py

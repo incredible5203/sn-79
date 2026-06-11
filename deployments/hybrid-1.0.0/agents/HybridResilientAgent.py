@@ -119,9 +119,11 @@ MIN_DIRECTIONAL_EDGE      = 0.10    # was 0.15
 MAX_TAPE_IMBALANCE        = 0.75
 
 # --- Completion / round-trip rules ---
-MIN_RT_EDGE_TICKS         = 1       # was 2 — lower bar to complete round-trips
-COMPLETION_STUCK_TICKS    = 40      # was 80 — unwind stuck inventory faster
+MIN_RT_EDGE_TICKS         = 2       # require 2 ticks edge — no loss completions
+COMPLETION_STUCK_TICKS    = 60      # ticks waiting before hold mode (no loss unwind)
+COMPLETION_HOLD_TICKS     = 120     # stop new quotes on stuck books
 MIN_QUANTITY              = 0.25
+ORDER_EXPIRY_NS           = 180_000_000_000  # GTT 180 sim-seconds (match pulse agents)
 
 # --- Inventory / risk ---
 MAX_INVENTORY_SKEW        = 0.015   # hard cap fraction of capital
@@ -242,6 +244,32 @@ def round_price(price: float, config) -> float:
 
 def round_qty(qty: float, config) -> float:
     return round(qty, getattr(config, 'volumeDecimals', 4))
+
+
+def place_passive_gtt(response, book_id, direction, qty, price) -> None:
+    """Post-only GTT limit — avoids stale GTC fills after the market moves."""
+    response.limit_order(
+        book_id=book_id,
+        direction=direction,
+        quantity=qty,
+        price=price,
+        post_only=True,
+        time_in_force='GTT',
+        expiry_period=ORDER_EXPIRY_NS,
+    )
+
+
+def profitable_close_side(ledger: PositionLedger, bid: float, ask: float, tick: float, config):
+    """Return (direction, price) to close at touch with edge, or (None, None) to hold."""
+    if ledger.net_qty > 0:
+        required_min = ledger.avg_cost + MIN_RT_EDGE_TICKS * tick
+        if ask >= required_min - 1e-12:
+            return "SELL", round_price(ask, config)
+    elif ledger.net_qty < 0:
+        required_max = ledger.avg_cost - MIN_RT_EDGE_TICKS * tick
+        if bid <= required_max + 1e-12:
+            return "BUY", round_price(bid, config)
+    return None, None
 
 
 def best_bid_ask(book) -> Tuple[Optional[float], Optional[float]]:
@@ -377,8 +405,10 @@ class HybridResilientAgent:
         self._slots:   dict[int, BookSlot]       = defaultdict(BookSlot)
         self._ofi_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=OFI_WINDOW_TICKS))
         self._completion_attempts: dict[int, int] = defaultdict(int)
+        self._hold_books: dict[int, int] = defaultdict(int)
+        self._ledger_synced = False
 
-        logger.info(f"HybridResilientAgent initialized for UID {uid}")
+        bt.logging.info(f"HybridResilientAgent initialized for UID {uid}")
 
     def process(self, notification):
         notification.acknowledged = True
@@ -420,6 +450,42 @@ class HybridResilientAgent:
 
         self._tick += 1
         self._process_notices()
+        self._sync_ledgers_from_accounts(state, tick_size(self.config) if self.config else 0.01)
+
+    def _book_in_hold(self, book_id: int) -> bool:
+        until = self._hold_books.get(book_id, 0)
+        return until > self._tick
+
+    def _sync_ledgers_from_accounts(self, state, tick: float):
+        """After restart, seed ledger from account skew so we don't trade blind."""
+        if self._ledger_synced or not self.accounts or not state.books:
+            return
+        synced = 0
+        for book_id, account in self.accounts.items():
+            book = state.books.get(book_id)
+            if book is None:
+                continue
+            bid, ask = best_bid_ask(book)
+            if bid is None or ask is None:
+                continue
+            mid = (bid + ask) / 2
+            if mid <= 0:
+                continue
+            base_val = account.base_balance.total * mid
+            quote_val = account.quote_balance.total
+            total = base_val + quote_val
+            if total < 1.0:
+                continue
+            target_base = (total * 0.5) / mid
+            net = round_qty(account.base_balance.total - target_base, self.config)
+            ledger = self._ledger[book_id]
+            if abs(net) >= MIN_QUANTITY * 0.5 and abs(ledger.net_qty) < 1e-9:
+                ledger.net_qty = net
+                ledger.avg_cost = mid
+                synced += 1
+        self._ledger_synced = True
+        if synced:
+            bt.logging.info(f"Ledger bootstrap: seeded {synced} books from account skew")
 
     def respond(self, state) -> object:
         response = self._make_response()
@@ -465,9 +531,6 @@ class HybridResilientAgent:
         # Phase 3: completion legs (no-loss, VWAP-based)
         self._place_completions(state, response, budget, tick)
 
-        # Phase 4: hard-cap inventory flatten (passive only)
-        self._flatten_skew(state, response, budget, tick)
-
         # Phase 5: Lane 1 -- presence coverage on all 128 books
         self._place_presence_quotes(state, response, budget, tick)
 
@@ -493,8 +556,7 @@ class HybridResilientAgent:
                     book_id = getattr(notice, 'bookId', None) or getattr(notice, 'book_id', None)
                     msg = str(getattr(notice, 'message', '')).lower()
                     if book_id is not None and 'loan' in msg:
-                        # Don't add alpha exposure on a book that's hitting loan
-                        # limits; presence lane still keeps it covered.
+                        self._hold_books[book_id] = self._tick + COMPLETION_HOLD_TICKS
                         self._slots[book_id].breaker_until_tick = max(
                             self._slots[book_id].breaker_until_tick,
                             self._tick + BREAKER_COOLDOWN_TICKS // 2,
@@ -625,17 +687,16 @@ class HybridResilientAgent:
 
     def _place_completions(self, state, response, budget: Budget, tick: float):
         """
-        For any book with a non-zero net position, try to flatten it at a
-        price that gives >= MIN_RT_EDGE_TICKS profit vs the VWAP cost
-        basis. If the market hasn't moved enough, hold (do nothing) --
-        unless the position has been stuck for COMPLETION_STUCK_TICKS,
-        in which case unwind passively at the touch (not crossing).
+        Close net inventory only when the touch offers >= MIN_RT_EDGE_TICKS
+        vs VWAP. Never force a loss-making unwind — stuck books enter hold
+        mode (no new presence/alpha) until flat or market moves favorably.
         """
         config = self.config
 
         for book_id, ledger in list(self._ledger.items()):
             if abs(ledger.net_qty) < MIN_QUANTITY * 0.5:
                 self._completion_attempts[book_id] = 0
+                self._hold_books.pop(book_id, None)
                 continue
             if not budget.ok(book_id):
                 continue
@@ -649,67 +710,34 @@ class HybridResilientAgent:
             if bid is None or ask is None:
                 continue
 
-            qty = round_qty(min(abs(ledger.net_qty), max(abs(ledger.net_qty), MIN_QUANTITY)), config)
-            qty = round_qty(max(qty, MIN_QUANTITY), config)
+            direction, price = profitable_close_side(ledger, bid, ask, tick, config)
+            if direction is None:
+                self._completion_attempts[book_id] += 1
+                if self._completion_attempts[book_id] >= COMPLETION_STUCK_TICKS:
+                    self._hold_books[book_id] = self._tick + COMPLETION_HOLD_TICKS
+                continue
 
-            stuck = self._completion_attempts[book_id] >= COMPLETION_STUCK_TICKS
+            qty = round_qty(max(min(abs(ledger.net_qty), ALPHA_QTY), MIN_QUANTITY), config)
 
             try:
-                if ledger.net_qty > 0:
-                    # Net long -> need to SELL to close. Require sell price
-                    # >= avg_cost + edge.
-                    required_min = ledger.avg_cost + MIN_RT_EDGE_TICKS * tick
-                    if ask >= required_min - 1e-12:
-                        price = round_price(ask, config)  # join ask passively
-                    elif stuck:
-                        price = round_price(ask, config)  # passive unwind
-                    else:
-                        self._completion_attempts[book_id] += 1
-                        continue
-
-                    sell_qty = min(qty, account.base_balance.free)
-                    sell_qty = round_qty(sell_qty, config)
+                if direction == "SELL":
+                    sell_qty = round_qty(min(qty, account.base_balance.free), config)
                     if sell_qty < MIN_QUANTITY:
                         continue
-
-                    response.limit_order(
-                        book_id=book_id, direction='SELL',
-                        quantity=sell_qty, price=price,
-                        post_only=True, time_in_force='GTC')
-                    budget.use(book_id)
-                    self._completion_attempts[book_id] = 0
-                    logger.debug(f"COMPLETE SELL {sell_qty}@{price} BOOK {book_id} "
-                                  f"(cost={ledger.avg_cost:.4f})")
-
+                    place_passive_gtt(response, book_id, "SELL", sell_qty, price)
                 else:
-                    # Net short -> need to BUY to close. Require buy price
-                    # <= avg_cost - edge.
-                    required_max = ledger.avg_cost - MIN_RT_EDGE_TICKS * tick
-                    if bid <= required_max + 1e-12:
-                        price = round_price(bid, config)  # join bid passively
-                    elif stuck:
-                        price = round_price(bid, config)
-                    else:
-                        self._completion_attempts[book_id] += 1
-                        continue
-
-                    needed_quote = qty * price
                     buy_qty = qty
-                    if account.quote_balance.free < needed_quote:
-                        affordable = account.quote_balance.free / max(price, 1e-9)
-                        buy_qty = round_qty(min(buy_qty, affordable), config)
+                    needed = buy_qty * price
+                    if account.quote_balance.free < needed:
+                        buy_qty = round_qty(
+                            account.quote_balance.free / max(price, 1e-9), config)
                     if buy_qty < MIN_QUANTITY:
                         continue
+                    place_passive_gtt(response, book_id, "BUY", buy_qty, price)
 
-                    response.limit_order(
-                        book_id=book_id, direction='BUY',
-                        quantity=buy_qty, price=price,
-                        post_only=True, time_in_force='GTC')
-                    budget.use(book_id)
-                    self._completion_attempts[book_id] = 0
-                    logger.debug(f"COMPLETE BUY {buy_qty}@{price} BOOK {book_id} "
-                                  f"(cost={ledger.avg_cost:.4f})")
-
+                budget.use(book_id)
+                self._completion_attempts[book_id] = 0
+                self._hold_books.pop(book_id, None)
             except Exception as e:
                 logger.debug(f"Completion error book {book_id}: {e}")
 
@@ -806,10 +834,10 @@ class HybridResilientAgent:
                 continue
             if not budget.ok(book_id):
                 continue
+            if self._book_in_hold(book_id):
+                continue
 
             ledger = self._ledger.get(book_id)
-            if ledger and abs(ledger.net_qty) >= MIN_QUANTITY * 0.5:
-                continue  # being completed this tick
 
             book    = state.books.get(book_id)
             account = self.accounts.get(book_id)
@@ -824,33 +852,30 @@ class HybridResilientAgent:
             if spread_ticks < PRESENCE_MIN_SPREAD_TICKS:
                 continue
 
-            # Alternate side by book_id and tick for natural round-trips
-            # over time without persistent directional bias.
-            side = "BUY" if (book_id + self._tick) % 2 == 0 else "SELL"
+            # Quote the reducing side when holding inventory; otherwise alternate.
+            if ledger and abs(ledger.net_qty) >= MIN_QUANTITY * 0.5:
+                side = "SELL" if ledger.net_qty > 0 else "BUY"
+            else:
+                side = "BUY" if (book_id + self._tick) % 2 == 0 else "SELL"
 
             qty = round_qty(max(PRESENCE_QTY, MIN_QUANTITY), config)
 
             try:
                 if side == "SELL":
                     if account.base_balance.free < qty:
-                        side = "BUY"
-                if side == "BUY":
+                        continue
+                    price = round_price(ask, config)
+                else:
                     price = round_price(bid, config)
                     needed = qty * price
                     if account.quote_balance.free < needed:
                         continue
-                else:
-                    price = round_price(ask, config)
 
-                # Avoid duplicate price
                 existing = {o.price for o in account.orders}
                 if price in existing:
                     continue
 
-                response.limit_order(
-                    book_id=book_id, direction=side,
-                    quantity=qty, price=price,
-                    post_only=True, time_in_force='GTC')
+                place_passive_gtt(response, book_id, side, qty, price)
                 budget.use(book_id)
                 placed += 1
             except Exception as e:
@@ -876,10 +901,12 @@ class HybridResilientAgent:
                 continue
             if not budget.ok(book_id):
                 continue
+            if self._book_in_hold(book_id):
+                continue
 
             ledger = self._ledger.get(book_id)
             if ledger and abs(ledger.net_qty) >= MIN_QUANTITY * 0.5:
-                continue  # being completed; don't add alpha exposure
+                continue  # complete inventory before adding alpha
 
             slot = self._slots[book_id]
             if slot.breaker_until_tick > self._tick:
@@ -960,10 +987,7 @@ class HybridResilientAgent:
                 if price in existing:
                     continue
 
-                response.limit_order(
-                    book_id=book_id, direction=direction,
-                    quantity=qty, price=price,
-                    post_only=True, time_in_force='GTC')
+                place_passive_gtt(response, book_id, direction, qty, price)
                 budget.use(book_id)
                 placed += 1
                 logger.debug(f"ALPHA {direction} {qty}@{price} BOOK {book_id} (ofi={conviction:.3f})")
