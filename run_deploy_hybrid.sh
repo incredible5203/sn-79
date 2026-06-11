@@ -1,5 +1,5 @@
 #!/bin/bash
-# HybridResilientAgent — frozen deployment bundle
+# UID 196 — AscendRealizedAgent (rocket + realized-PnL overlay)
 # 1. Edit deployments/hybrid-1.0.0/miner.env (PM2_NAME, UID, wallet, port)
 # 2. ./run_deploy_hybrid.sh
 set -e

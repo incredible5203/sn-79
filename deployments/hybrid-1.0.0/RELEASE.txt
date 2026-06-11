@@ -1,8 +1,14 @@
-release_id=hybrid-1.0.2
-agent=HybridResilientAgent
+release_id=hybrid-realized-1.0.0
+agent=AscendRealizedAgent
+base=ascend_score_tick (pulse-v2 rocket profile)
+overlay=_realized_overlay.py (OFI veto, inventory gate, per-book risk-off)
+uid=196
+hotkey=hot4
+pm2=79-hybrid
 git_commit=local
 bundled_at=2026-06-11T00:00:00Z
-notes=no-loss-only completions, GTT expiry, ledger bootstrap, inventory-aware presence
 files:
-  HybridResilientAgent.py
-  _sn79_compat.py
+  AscendRealizedAgent.py
+  _ascend_agent_base.py
+  _realized_overlay.py
+  competitive_utils.py

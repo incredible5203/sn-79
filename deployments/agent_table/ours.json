@@ -21,10 +21,10 @@
     },
     {
       "agent_id": "196",
-      "label": "deploy-kappa-pulse-1.0",
-      "deployment": "kappa-1.0.0",
-      "run_script": "run_deploy_kappa.sh",
-      "note": "AscendPulseAgent rocket (UID 65 engine, max_books_per_tick=12)"
+      "label": "deploy-hybrid-realized-1.0",
+      "deployment": "hybrid-1.0.0",
+      "run_script": "run_deploy_hybrid.sh",
+      "note": "AscendRealizedAgent rocket + realized-PnL overlay"
     }
   ]
 }
