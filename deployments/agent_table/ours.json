@@ -18,6 +18,12 @@
       "label": "deploy-forge-v2-1.7",
       "deployment": "forge-v2-1.0.0",
       "run_script": "run_deploy_forge_v2.sh"
+    },
+    {
+      "agent_id": "196",
+      "label": "deploy-hybrid-1.0",
+      "deployment": "hybrid-1.0.0",
+      "run_script": "run_deploy_hybrid.sh"
     }
   ]
 }
