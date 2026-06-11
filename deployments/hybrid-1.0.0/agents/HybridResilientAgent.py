@@ -99,47 +99,47 @@ logger = logging.getLogger(__name__)
 # TUNABLE PARAMETERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-GRACE_PERIOD_SECONDS      = 620     # don't trade before this (sim seconds)
+GRACE_PERIOD_SECONDS      = 120     # start trading sooner (was 620)
 
 # --- Lane 1: presence coverage (Penalty -> 0) ---
 PRESENCE_GROUPS           = 16      # all 128 books cycle through 16 buckets
-PRESENCE_QTY              = 0.25    # MIN_QUANTITY -- smallest legal order
+PRESENCE_QTY              = 0.30    # headroom above MIN_QUANTITY (was 0.25)
 PRESENCE_MIN_SPREAD_TICKS = 1       # almost any book qualifies for presence
 PRESENCE_MAX_PER_TICK     = 12      # cap presence orders placed per tick
 
 # --- Lane 2: alpha quoting (PnL / Kappa growth) ---
 ALPHA_ROTATION_GROUPS     = 12
-ALPHA_BOOKS_PER_TICK      = 8
-ALPHA_QTY                 = 0.35
+ALPHA_BOOKS_PER_TICK      = 10      # was 8
+ALPHA_QTY                 = 0.50    # was 0.35
 MIN_SPREAD_TICKS          = 4
 MAX_SPREAD_RATIO          = 0.0025
 MAX_MAKER_FEE             = 0.0014
-OFI_WINDOW_TICKS          = 4
-MIN_DIRECTIONAL_EDGE      = 0.15
+OFI_WINDOW_TICKS          = 6       # was 4
+MIN_DIRECTIONAL_EDGE      = 0.10    # was 0.15
 MAX_TAPE_IMBALANCE        = 0.75
 
 # --- Completion / round-trip rules ---
-MIN_RT_EDGE_TICKS         = 2       # required edge vs VWAP cost basis
-COMPLETION_STUCK_TICKS    = 80      # escape-valve: unwind passively after this
+MIN_RT_EDGE_TICKS         = 1       # was 2 — lower bar to complete round-trips
+COMPLETION_STUCK_TICKS    = 40      # was 80 — unwind stuck inventory faster
 MIN_QUANTITY              = 0.25
 
 # --- Inventory / risk ---
 MAX_INVENTORY_SKEW        = 0.015   # hard cap fraction of capital
-SOFT_SKEW_THRESHOLD       = 0.006   # bias quote side before hitting hard cap
+SOFT_SKEW_THRESHOLD       = 0.006   # used by Phase 4 flatten only
 REPAY_FIFO_EACH_TICK      = 1
 
 # --- Circuit breaker ---
 PNL_WINDOW_TICKS          = 300     # rolling window for per-book realized PnL
-PNL_LOSS_THRESHOLD        = -0.002  # fraction of miner_wealth; trip breaker
-BREAKER_COOLDOWN_TICKS    = 600     # ticks before re-enabling alpha on a book
+PNL_LOSS_THRESHOLD        = -0.004  # was -0.002 — less hair-trigger breaker
+BREAKER_COOLDOWN_TICKS    = 200     # was 600 — recover alpha faster
 
 # --- Stale order management ---
-STALE_AGE_SECONDS         = 8
-STALE_TICKS_OUTSIDE       = 1
+STALE_AGE_SECONDS         = 20      # was 8 — give quotes time to fill
+STALE_TICKS_OUTSIDE       = 2       # was 1
 MAX_CANCEL_PER_TICK       = 14
 
 # --- Instruction budget ---
-MAX_TOTAL_INSTRUCTIONS    = 30
+MAX_TOTAL_INSTRUCTIONS    = 36      # was 30
 MAX_PER_BOOK              = 4
 
 
@@ -660,7 +660,7 @@ class HybridResilientAgent:
                     # >= avg_cost + edge.
                     required_min = ledger.avg_cost + MIN_RT_EDGE_TICKS * tick
                     if ask >= required_min - 1e-12:
-                        price = round_price(max(ask, required_min), config)
+                        price = round_price(ask, config)  # join ask passively
                     elif stuck:
                         price = round_price(ask, config)  # passive unwind
                     else:
@@ -686,7 +686,7 @@ class HybridResilientAgent:
                     # <= avg_cost - edge.
                     required_max = ledger.avg_cost - MIN_RT_EDGE_TICKS * tick
                     if bid <= required_max + 1e-12:
-                        price = round_price(min(bid, required_max), config)
+                        price = round_price(bid, config)  # join bid passively
                     elif stuck:
                         price = round_price(bid, config)
                     else:
@@ -927,20 +927,6 @@ class HybridResilientAgent:
                 conviction = -ofi_signal
             else:
                 continue  # no conviction -> skip (presence lane still covers)
-
-            # Inventory skew override
-            try:
-                bv = account.base_balance.total * mid
-                qv = account.quote_balance.total
-                tv = bv + qv
-                skew = (bv - qv) / max(tv, 1.0)
-            except Exception:
-                skew = 0.0
-
-            if skew > SOFT_SKEW_THRESHOLD and direction == "BUY":
-                direction = "SELL"
-            elif skew < -SOFT_SKEW_THRESHOLD and direction == "SELL":
-                direction = "BUY"
 
             candidates.append((conviction, book_id, direction, bid, ask, account))
 
