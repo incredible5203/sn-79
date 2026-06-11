@@ -1,11 +1,10 @@
-release_id=kappa-pulse-1.0.0
-agent=AscendPulseAgent
-base=pulse-v2-1.0.0 (UID 65)
-profile=rocket
-tweaks=cancel_all_on_startup=1 max_books_per_tick=12
+release_id=kappa-2.0.0
+agent=AscendKappaAgent
+engine=ascend_score_tick.py (ScoreTickEngine)
+books=0-42
 git_commit=local
 bundled_at=2026-06-11T00:00:00Z
 files:
-  AscendPulseAgent.py
-  _ascend_agent_base.py
-  competitive_utils.py
+  AscendKappaAgent.py
+  ascend_score_tick.py
+  _sn79_compat.py

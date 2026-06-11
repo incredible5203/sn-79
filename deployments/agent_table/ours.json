@@ -21,10 +21,10 @@
     },
     {
       "agent_id": "196",
-      "label": "deploy-hybrid-realized-1.0",
+      "label": "deploy-hybrid-2.0",
       "deployment": "hybrid-1.0.0",
       "run_script": "run_deploy_hybrid.sh",
-      "note": "AscendRealizedAgent rocket + realized-PnL overlay"
+      "note": "HybridResilientAgent v2 (books 86-127, fee-aware ascend_score_tick)"
     }
   ]
 }
