@@ -35,14 +35,14 @@
       "note": "AscendKappaFastAgent — Option C test UID; 24h pass: penalty=0, kappa>=0.504 rising, realized>0, min_rt>3k"
     },
     {
-      "agent_id": "pending",
+      "agent_id": "18",
       "label": "deploy-predictive-maker-1.0",
       "deployment": "predictive-maker-1.0.0",
       "run_script": "run_deploy_predictive_maker.sh",
       "note": "PredictiveMakerAgent predict-1.1.0 — post-only completions, 4-tick edge, 8 books/tick; 24h pass: penalty=0, kappa>=0.504, realized>0"
     },
     {
-      "agent_id": "18",
+      "agent_id": "48",
       "label": "deploy-adaptive-steady-1.0",
       "deployment": "adaptive-steady-1.0.0",
       "run_script": "run_deploy_adaptive_steady.sh",
