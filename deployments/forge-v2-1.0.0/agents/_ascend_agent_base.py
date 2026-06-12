@@ -117,21 +117,22 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
         "max_total_instructions": 29,
         "max_instructions_per_book": 5,
         "max_requote_per_tick": 11,
-        "max_touch_per_tick": 11,
+        "max_touch_per_tick": 0,
         "max_flatten_per_tick": 13,
         "book_rotation_groups": 11,
         "cadence_interval_ns": 9_000_000_000,
         "rotation_windows": 10,
-        "min_spread_ticks": 2.5,
-        "min_quote_spread_ticks": 3.0,
-        "min_rt_edge_ticks": 3.0,
-        "min_quote_rt_edge_ticks": 3.5,
+        "min_spread_ticks": 6.0,
+        "min_quote_spread_ticks": 6.0,
+        "min_rt_edge_ticks": 3.5,
+        "min_quote_rt_edge_ticks": 4.0,
         "min_completion_rt_edge_ticks": 4.5,
         "min_microprice_edge_ticks": 0.6,
         "inside_depth_ticks": 1,
         "deep_spread_ticks": 6.0,
         "two_sided_wide_ticks": 4.5,
-        "touch_join_spread_ticks": 3.0,
+        "touch_join_spread_ticks": 99.0,
+        "allow_touch_join": False,
         "inactive_book_frac": 0.0,
         "max_spread_ratio": 0.0013,
         "inventory_skew_soft": 0.0016,
@@ -439,6 +440,14 @@ class AscendAgent(FinanceSimulationAgent):
                 defaults.get("max_touch_per_tick", 8),
             )
         )
+        self.allow_touch_join = param_bool(
+            getattr(
+                self.config,
+                "allow_touch_join",
+                defaults.get("allow_touch_join", False),
+            ),
+            False,
+        )
         self.max_flatten_per_tick = int(
             getattr(
                 self.config,
@@ -475,6 +484,7 @@ class AscendAgent(FinanceSimulationAgent):
             f"min_spread={self.min_spread_ticks} "
             f"min_rt={self.min_rt_edge_ticks} "
             f"min_comp={self.min_completion_rt_edge_ticks} "
+            f"touch_join={self.allow_touch_join} "
             f"two_sided>={self.two_sided_wide_ticks} "
             f"skew_soft={self.inventory_skew_soft} "
             f"inactive_skip={self.inactive_book_frac} "
@@ -494,15 +504,13 @@ class AscendAgent(FinanceSimulationAgent):
         )
 
     def _decay_requote(self) -> None:
-        expired: list[int] = []
-        for book_id, (side, age, fill_price) in self._requote.items():
+        for book_id, (side, age, fill_price) in list(self._requote.items()):
             age += 1
             if age > self.requote_ttl_ticks:
-                expired.append(book_id)
+                # Re-queue instead of dropping — inventory still needs completion
+                self._requote[book_id] = (side, 0, fill_price)
             else:
                 self._requote[book_id] = (side, age, fill_price)
-        for book_id in expired:
-            del self._requote[book_id]
 
     def _requote_hints(self) -> dict[int, tuple[OrderDirection, float]]:
         return {
@@ -537,7 +545,7 @@ class AscendAgent(FinanceSimulationAgent):
         if self._run_startup_cancel_all(response):
             return response
         self._decay_requote()
-        ascend_score_tick(
+        completed = ascend_score_tick(
             response,
             state,
             self.accounts,
@@ -578,5 +586,8 @@ class AscendAgent(FinanceSimulationAgent):
             touch_join_spread_ticks=self.touch_join_spread_ticks,
             max_touch_per_tick=self.max_touch_per_tick,
             max_cold_books_per_tick=self.max_cold_books_per_tick,
+            allow_touch_join=self.allow_touch_join,
         )
+        for book_id in completed:
+            self._requote.pop(book_id, None)
         return response

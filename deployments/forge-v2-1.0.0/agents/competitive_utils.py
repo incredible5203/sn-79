@@ -106,6 +106,7 @@ def place_limit(
     *,
     volume_decimals: int | None = None,
     min_quantity: float = 0.32,
+    post_only: bool = True,
 ) -> None:
     if volume_decimals is not None:
         qty = sim_order_qty(min_quantity, qty, 1.0, volume_decimals)
@@ -115,6 +116,7 @@ def place_limit(
         qty,
         price,
         stp=STP.CANCEL_BOTH,
+        postOnly=post_only,
         timeInForce=TimeInForce.GTT,
         expiryPeriod=expiry_period,
     )
@@ -587,6 +589,52 @@ def _limit_price(
     raise ValueError(f"unknown price mode: {mode}")
 
 
+def _min_spread_ticks_for_rt(inside_depth: int, min_rt_edge_ticks: float) -> float:
+    """Minimum spread for inside entry + inside completion + RT edge."""
+    return 2 * inside_depth + min_rt_edge_ticks + 1
+
+
+def _completion_price_from_fill(
+    fill_price: float,
+    comp_dir: OrderDirection,
+    best_bid: float,
+    best_ask: float,
+    tick: float,
+    pdec: int,
+    min_rt_edge_ticks: float,
+    inside_depth: int = 1,
+) -> float | None:
+    """
+    Post-only completion inside spread; never buy above fill-edge or sell below fill+edge.
+    """
+    if tick <= 0:
+        return None
+    spread_ticks = (best_ask - best_bid) / tick
+    if spread_ticks < _min_spread_ticks_for_rt(inside_depth, min_rt_edge_ticks):
+        return None
+
+    edge = min_rt_edge_ticks * tick
+    inside_buy = round_price(
+        min(best_bid + inside_depth * tick, best_ask - tick), pdec
+    )
+    inside_sell = round_price(
+        max(best_ask - inside_depth * tick, best_bid + tick), pdec
+    )
+
+    if comp_dir == OrderDirection.BUY:
+        max_pay = round_price(fill_price - edge, pdec)
+        price = min(max_pay, inside_buy)
+        if price >= best_ask or (fill_price - price) < edge * 0.99:
+            return None
+        return price
+
+    min_receive = round_price(fill_price + edge, pdec)
+    price = max(min_receive, inside_sell)
+    if price <= best_bid or price >= best_ask or (price - fill_price) < edge * 0.99:
+        return None
+    return price
+
+
 def _inside_spread_prices(
     best_bid: float, best_ask: float, tick: float, pdec: int
 ) -> tuple[float, float]:
@@ -614,13 +662,24 @@ def _completion_rt_edge_ticks(
     best_ask: float,
     tick: float,
     pdec: int,
+    min_rt_edge_ticks: float = 0.0,
+    inside_depth: int = 1,
 ) -> float:
-    """Expected round-trip edge in ticks after a maker fill and inside completion."""
+    """Expected round-trip edge in ticks using fill-aware inside completion."""
     if tick <= 0:
         return 0.0
-    comp_price = _limit_price(
-        comp_dir, best_bid, best_ask, tick, pdec, mode="inside"
+    comp_price = _completion_price_from_fill(
+        fill_price,
+        comp_dir,
+        best_bid,
+        best_ask,
+        tick,
+        pdec,
+        min_rt_edge_ticks,
+        inside_depth,
     )
+    if comp_price is None:
+        return 0.0
     if comp_dir == OrderDirection.SELL:
         edge = comp_price - fill_price
     else:
@@ -1607,7 +1666,8 @@ def ascend_score_tick(
     touch_join_spread_ticks: float = 4.5,
     max_touch_per_tick: int = 8,
     max_cold_books_per_tick: int = 4,
-) -> None:
+    allow_touch_join: bool = False,
+) -> set[int]:
     """
     Ascend scoring engine — fast κ growth, Penalty → 0, positive realized PnL.
 
@@ -1616,11 +1676,14 @@ def ascend_score_tick(
 
     Rules:
       - Completion-first inside-spread legs after maker fills (edge vs fill price)
-      - Touch-join on wide spreads for fill rate (top miners satisfy more orders)
+      - Inside-spread quotes only by default (touch-join disabled — adverse selection)
       - Two-sided only on very wide spreads with near-zero skew
       - Dedicated flatten budget (max_flatten_per_tick) so inventory does not accumulate
       - Microprice direction gate with rotation fallback; cold-book bonus for coverage
+
+    Returns book IDs where a completion order was placed this tick.
     """
+    completions_placed: set[int] = set()
     requote_hints = requote_hints or {}
     completion_edge = (
         min_rt_edge_ticks
@@ -1648,6 +1711,9 @@ def ascend_score_tick(
     }
     budget = _InstructionBudget(max_instructions_per_book, max_total_instructions)
     base_depth = max(1, inside_depth_ticks)
+    spread_floor = lambda edge_ticks: max(
+        min_spread_ticks, _min_spread_ticks_for_rt(base_depth, edge_ticks)
+    )
 
     repay_loans_fifo(
         response,
@@ -1668,7 +1734,7 @@ def ascend_score_tick(
         if spread_r > max_spread_ratio:
             continue
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-        if spread_ticks < min_spread_ticks:
+        if spread_ticks < spread_floor(min_rt_edge_ticks):
             continue
         if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
             continue
@@ -1692,7 +1758,7 @@ def ascend_score_tick(
             if spread_r > max_spread_ratio * 1.5:
                 continue
             spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-            if spread_ticks < max(1.0, min_spread_ticks - 1.0):
+            if spread_ticks < max(1.0, spread_floor(min_rt_edge_ticks) - 1.0):
                 continue
             if not maker_fee_ok(accounts, book_id, max_fee_rate):
                 continue
@@ -1701,7 +1767,7 @@ def ascend_score_tick(
             last_mid[book_id] = mid
 
     if not book_rows:
-        return
+        return completions_placed
 
     qty = sim_order_qty(min_quantity, max_quantity, quantity_scale, vdec)
     placed: set[int] = set()
@@ -1727,33 +1793,47 @@ def ascend_score_tick(
             max_cancel=max_instructions_per_book,
         )
 
-    requote_jobs: list[tuple[float, int, float, float, float, OrderDirection, bool]] = []
+    requote_jobs: list[tuple[float, int, float, float, float, OrderDirection, float]] = []
     for book_id, (comp_dir, fill_price) in requote_hints.items():
         row = book_rows.get(book_id)
         if row is None or _has_loan(accounts, book_id):
             continue
         _book, best_bid, best_ask, mid = row
         spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-        if spread_ticks < min_spread_ticks:
+        if spread_ticks < spread_floor(completion_edge):
             continue
-        if _rt_edge_ticks(best_bid, best_ask, tick, pdec) < min_rt_edge_ticks:
+        comp_price = _completion_price_from_fill(
+            fill_price,
+            comp_dir,
+            best_bid,
+            best_ask,
+            tick,
+            pdec,
+            completion_edge,
+            base_depth,
+        )
+        if comp_price is None:
             continue
         comp_edge = _completion_rt_edge_ticks(
-            fill_price, comp_dir, best_bid, best_ask, tick, pdec
+            fill_price,
+            comp_dir,
+            best_bid,
+            best_ask,
+            tick,
+            pdec,
+            completion_edge,
+            base_depth,
         )
-        if comp_edge < min_rt_edge_ticks:
-            continue
-        touch_comp = comp_edge < completion_edge
         fs = book_fill_score(
             _book, accounts, book_id, spread_ticks=spread_ticks, requote=True
         )
-        prio = comp_edge + fs * 0.15 + (120.0 if touch_comp else 150.0)
+        prio = comp_edge + fs * 0.15 + 150.0
         requote_jobs.append(
-            (prio, book_id, best_bid, best_ask, mid, comp_dir, touch_comp)
+            (prio, book_id, best_bid, best_ask, mid, comp_dir, comp_price)
         )
     requote_jobs.sort(key=lambda x: -x[0])
     requote_count = 0
-    for _prio, book_id, best_bid, best_ask, _mid, trade_dir, touch_comp in requote_jobs:
+    for _prio, book_id, best_bid, best_ask, _mid, trade_dir, price in requote_jobs:
         if requote_count >= max_requote_per_tick or len(placed) >= max_books_per_tick + 1:
             break
         if book_id in placed:
@@ -1763,13 +1843,6 @@ def ascend_score_tick(
             continue
         if trade_dir == OrderDirection.SELL and skew >= inventory_skew_soft:
             continue
-        spread_ticks = (best_ask - best_bid) / tick if tick > 0 else 0.0
-        depth = base_depth + 1 if spread_ticks >= deep_spread_ticks else base_depth
-        comp_mode = "join_touch" if touch_comp else "inside"
-        price = _limit_price(
-            trade_dir, best_bid, best_ask, tick, pdec,
-            mode=comp_mode, depth_ticks=depth if comp_mode == "inside" else 0,
-        )
         account = accounts[book_id]
         if trade_dir == OrderDirection.BUY:
             if price >= best_ask or account.quote_balance.free < qty * price:
@@ -1778,13 +1851,17 @@ def ascend_score_tick(
             continue
         if not budget.can_place(book_id, 1):
             continue
+        n_before = len(response.instructions)
         place_limit(
             response, book_id, trade_dir, qty, price, expiry_period,
             volume_decimals=vdec, min_quantity=min_quantity,
         )
+        if len(response.instructions) <= n_before:
+            continue
         budget.mark(book_id, 1)
         placed.add(book_id)
         requote_count += 1
+        completions_placed.add(book_id)
         direction[book_id] = (
             OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
         )
@@ -1862,7 +1939,7 @@ def ascend_score_tick(
     touch_jobs.sort(key=lambda x: -x[0])
 
     touch_count = 0
-    if not risk_off:
+    if allow_touch_join and max_touch_per_tick > 0 and not risk_off:
         for _rank, book_id, book, best_bid, best_ask, mid in touch_jobs:
             if touch_count >= max_touch_per_tick or budget.total >= max_total_instructions:
                 break
@@ -2046,7 +2123,8 @@ def ascend_score_tick(
         quote_mode = (
             "join_touch"
             if (
-                spread_ticks >= touch_join_spread_ticks
+                allow_touch_join
+                and spread_ticks >= touch_join_spread_ticks
                 and rt_edge >= completion_edge
                 and abs(skew) < inventory_skew_soft * 0.4
                 and not risk_off
@@ -2186,7 +2264,8 @@ def ascend_score_tick(
                     )
             rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
             if (
-                spread_ticks >= touch_join_spread_ticks
+                allow_touch_join
+                and spread_ticks >= touch_join_spread_ticks
                 and rt_edge >= completion_edge
                 and abs(skew) < inventory_skew_soft * 0.5
             ):
@@ -2215,6 +2294,8 @@ def ascend_score_tick(
                 OrderDirection.SELL if trade_dir == OrderDirection.BUY else OrderDirection.BUY
             )
             bootstrap_placed += 1
+
+    return completions_placed
 
 
 def turbo_power_score_tick(

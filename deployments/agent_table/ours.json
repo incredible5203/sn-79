@@ -15,9 +15,10 @@
     },
     {
       "agent_id": "158",
-      "label": "deploy-forge-v2-1.7",
+      "label": "deploy-forge-v2-1.8",
       "deployment": "forge-v2-1.0.0",
-      "run_script": "run_deploy_forge_v2.sh"
+      "run_script": "run_deploy_forge_v2.sh",
+      "note": "AscendForgeAgent forge-v2-1.8.0 — inside-spread + completion discipline canary on UID 158"
     },
     {
       "agent_id": "127",

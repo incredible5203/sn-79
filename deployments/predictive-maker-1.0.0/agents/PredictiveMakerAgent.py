@@ -53,7 +53,7 @@ class _InstructionBudget:
 class PredictiveMakerAgent(FinanceSimulationAgent):
     """
     Option A from SN-79-prediction-agent-strategy-guide:
-    touch-join maker + combined microstructure signal for side selection,
+    inside-spread maker + combined microstructure signal for side selection,
     completion-first round-trips, 12-bucket rotation for penalty=0.
     """
 
@@ -89,6 +89,7 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
         self.min_rt_edge_ticks = float(
             getattr(self.config, "min_completion_rt_edge_ticks", 4.0)
         )
+        self.inside_ticks = int(getattr(self.config, "inside_ticks", 1))
         self.completion_max_age_ns = int(
             getattr(self.config, "completion_max_age_ns", 12_000_000_000)
         )
@@ -118,7 +119,8 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
 
         bt.logging.info(
             f"{self.agent_label} | rot={self.rotation_groups} books/tick={self.max_books_per_tick} "
-            f"min_spread={self.min_spread_ticks} min_rt_edge={self.min_rt_edge_ticks} "
+            f"min_spread={self.min_spread_ticks} inside={self.inside_ticks} "
+            f"min_rt_edge={self.min_rt_edge_ticks} "
             f"signal_strong={self.signal_threshold_strong} qty={self.base_quantity} "
             f"cancel_all_on_startup={self.cancel_all_on_startup}"
         )
@@ -247,6 +249,44 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
     def _round_price(self, price: float, pdec: int) -> float:
         return round(price, pdec)
 
+    def _min_spread_ticks_for_rt(self) -> float:
+        """Room for inside entry + inside completion + min RT edge."""
+        return 2 * self.inside_ticks + self.min_rt_edge_ticks + 1
+
+    def _spread_ticks_ok(self, spread_ticks: float) -> bool:
+        required = max(self.min_spread_ticks, self._min_spread_ticks_for_rt())
+        return spread_ticks >= required
+
+    def _instruction_count(self, response: FinanceAgentResponse) -> int:
+        return len(response.instructions)
+
+    def _try_limit_order(self, response: FinanceAgentResponse, **kwargs) -> bool:
+        before = self._instruction_count(response)
+        response.limit_order(**kwargs)
+        return self._instruction_count(response) > before
+
+    def _inside_quote_price(
+        self,
+        trade_dir: OrderDirection,
+        bid_p: float,
+        ask_p: float,
+        tick: float,
+        pdec: int,
+    ) -> float | None:
+        """Safe inside-spread maker price (bid+tick / ask-tick), not touch-join."""
+        spread_ticks = (ask_p - bid_p) / tick
+        if not self._spread_ticks_ok(spread_ticks):
+            return None
+        if trade_dir == OrderDirection.BUY:
+            price = self._round_price(bid_p + self.inside_ticks * tick, pdec)
+            if price >= ask_p:
+                return None
+            return price
+        price = self._round_price(ask_p - self.inside_ticks * tick, pdec)
+        if price <= bid_p:
+            return None
+        return price
+
     def _inventory_skew(self, account, mid: float) -> float:
         bv = account.base_balance.total * mid
         qv = account.quote_balance.total
@@ -272,29 +312,36 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
         tick: float,
         pdec: int,
     ) -> tuple[OrderDirection, float] | None:
-        """Post-only completion inside spread; None if min edge cannot be met."""
+        """
+        Post-only completion inside spread.
+        Never raise BUY above fill-edge or lower SELL below fill+edge.
+        """
         edge = self.min_rt_edge_ticks * tick
-        if ask_p - bid_p < 2 * tick:
+        spread_ticks = (ask_p - bid_p) / tick
+        if not self._spread_ticks_ok(spread_ticks):
             return None
 
+        inside_buy = self._round_price(bid_p + self.inside_ticks * tick, pdec)
+        inside_sell = self._round_price(ask_p - self.inside_ticks * tick, pdec)
+
         if hint.side == "BUY":
+            # Sold at fill_price → buy back at most fill_price - edge
             trade_dir = OrderDirection.BUY
-            cap = self._round_price(ask_p - tick, pdec)
-            target = self._round_price(hint.fill_price - edge, pdec)
-            price = min(target, cap)
-            if price < bid_p:
-                price = self._round_price(bid_p, pdec)
-            if price >= ask_p or (hint.fill_price - price) < edge * 0.99:
+            max_pay = self._round_price(hint.fill_price - edge, pdec)
+            price = min(max_pay, inside_buy)
+            if price >= ask_p or price > max_pay:
+                return None
+            if (hint.fill_price - price) < edge * 0.99:
                 return None
             return trade_dir, price
 
+        # Bought at fill_price → sell at least fill_price + edge
         trade_dir = OrderDirection.SELL
-        floor = self._round_price(bid_p + tick, pdec)
-        target = self._round_price(hint.fill_price + edge, pdec)
-        price = max(target, floor)
-        if price > ask_p:
-            price = self._round_price(ask_p, pdec)
-        if price <= bid_p or (price - hint.fill_price) < edge * 0.99:
+        min_receive = self._round_price(hint.fill_price + edge, pdec)
+        price = max(min_receive, inside_sell)
+        if price <= bid_p or price >= ask_p or price < min_receive:
+            return None
+        if (price - hint.fill_price) < edge * 0.99:
             return None
         return trade_dir, price
 
@@ -318,7 +365,9 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
             bid_p, ask_p = book.bids[0].price, book.asks[0].price
             age_ns = state.timestamp - hint.queued_ts_ns
             if age_ns > self.completion_max_age_ns:
-                done.append(book_id)
+                # Re-queue: keep hint alive for flatten/completion on next ticks
+                hint.attempts += 1
+                hint.queued_ts_ns = state.timestamp
                 continue
 
             qty = self._round_qty(max(hint.fill_qty, self.min_quantity), vdec)
@@ -331,17 +380,19 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
             if qty < self.min_quantity:
                 continue
 
-            response.limit_order(
-                book_id,
-                trade_dir,
-                qty,
-                price,
+            expiry = min(self.expiry_period, self.completion_max_age_ns // 2)
+            if self._try_limit_order(
+                response,
+                book_id=book_id,
+                direction=trade_dir,
+                quantity=qty,
+                price=price,
                 postOnly=True,
                 timeInForce=TimeInForce.GTT,
-                expiryPeriod=min(self.expiry_period, self.completion_max_age_ns // 2),
-            )
-            budget.use(book_id)
-            done.append(book_id)
+                expiryPeriod=expiry,
+            ):
+                budget.use(book_id)
+                done.append(book_id)
 
         for b in done:
             self._completions.pop(b, None)
@@ -369,26 +420,33 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
 
             if skew > self.inventory_hard:
                 trade_dir = OrderDirection.SELL
-                price = self._round_price(ask_p, pdec)
+                price = self._inside_quote_price(
+                    trade_dir, bid_p, ask_p, tick, pdec
+                )
                 qty = self._round_qty(max(account.base_balance.free * 0.25, self.min_quantity), vdec)
             else:
                 trade_dir = OrderDirection.BUY
-                price = self._round_price(bid_p, pdec)
+                price = self._inside_quote_price(
+                    trade_dir, bid_p, ask_p, tick, pdec
+                )
                 qty = self._round_qty(
                     max(account.quote_balance.free * 0.25 / max(ask_p, 1e-9), self.min_quantity),
                     vdec,
                 )
+            if price is None:
+                continue
             qty = self._free_qty(trade_dir, qty, price, account)
             if qty < self.min_quantity:
                 continue
-            if trade_dir == OrderDirection.BUY and price >= ask_p:
-                continue
-            if trade_dir == OrderDirection.SELL and price <= bid_p:
-                continue
-            response.limit_order(
-                book_id, trade_dir, qty, price, postOnly=True
-            )
-            budget.use(book_id)
+            if self._try_limit_order(
+                response,
+                book_id=book_id,
+                direction=trade_dir,
+                quantity=qty,
+                price=price,
+                postOnly=True,
+            ):
+                budget.use(book_id)
 
     def _place_predictive_quotes(
         self,
@@ -423,7 +481,7 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
             if mid <= 0 or spread <= 0:
                 continue
             spread_ticks = spread / tick
-            if spread_ticks < self.min_spread_ticks:
+            if not self._spread_ticks_ok(spread_ticks):
                 continue
             if spread / mid > self.max_spread_ratio:
                 continue
@@ -473,31 +531,26 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
 
             if signal > self.signal_threshold_strong:
                 trade_dir = OrderDirection.SELL
-                price = self._round_price(ask_p, pdec)
             elif signal < -self.signal_threshold_strong:
                 trade_dir = OrderDirection.BUY
-                price = self._round_price(bid_p, pdec)
             elif skew > self.inventory_soft:
                 trade_dir = OrderDirection.SELL
-                price = self._round_price(ask_p, pdec)
             elif skew < -self.inventory_soft:
                 trade_dir = OrderDirection.BUY
-                price = self._round_price(bid_p, pdec)
             elif signal > self.signal_threshold_weak:
                 trade_dir = OrderDirection.SELL
-                price = self._round_price(ask_p, pdec)
             elif signal < -self.signal_threshold_weak:
                 trade_dir = OrderDirection.BUY
-                price = self._round_price(bid_p, pdec)
             else:
                 trade_dir = (
                     OrderDirection.SELL
                     if (book_id + self._tick) % 2 == 0
                     else OrderDirection.BUY
                 )
-                price = self._round_price(
-                    ask_p if trade_dir == OrderDirection.SELL else bid_p, pdec
-                )
+
+            price = self._inside_quote_price(trade_dir, bid_p, ask_p, tick, pdec)
+            if price is None:
+                continue
 
             if abs(signal) > self.signal_adverse_skip:
                 if signal > 0 and trade_dir == OrderDirection.BUY:
@@ -521,16 +574,17 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
             if trade_dir == OrderDirection.SELL and price <= bid_p:
                 continue
 
-            response.limit_order(
-                book_id,
-                trade_dir,
-                qty,
-                price,
+            if self._try_limit_order(
+                response,
+                book_id=book_id,
+                direction=trade_dir,
+                quantity=qty,
+                price=price,
                 postOnly=True,
                 timeInForce=TimeInForce.GTC,
-            )
-            budget.use(book_id)
-            placed += 1
+            ):
+                budget.use(book_id)
+                placed += 1
 
 
 if __name__ == "__main__":
