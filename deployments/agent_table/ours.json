@@ -20,13 +20,6 @@
       "run_script": "run_deploy_forge_v2.sh"
     },
     {
-      "agent_id": "196",
-      "label": "deploy-hybrid-4.0",
-      "deployment": "hybrid-1.0.0",
-      "run_script": "run_deploy_hybrid.sh",
-      "note": "AscendPulseAgent rocket (UID 65 parity); cancel_all on startup for PnL recovery"
-    },
-    {
       "agent_id": "127",
       "label": "deploy-predict-1.0",
       "deployment": "predict-1.0.0",
@@ -34,7 +27,7 @@
       "note": "AscendPredictAgent — surge + PassiveAggressive overlay; set UID/hotkey in miner.env"
     },
     {
-      "agent_id": "0",
+      "agent_id": "51",
       "label": "deploy-kappa-fast-1.0",
       "deployment": "kappa-fast-1.0.0",
       "run_script": "run_deploy_kappa_fast.sh",
