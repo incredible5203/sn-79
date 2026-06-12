@@ -32,6 +32,13 @@
       "deployment": "predict-1.0.0",
       "run_script": "run_deploy_predict.sh",
       "note": "AscendPredictAgent — surge + PassiveAggressive overlay; set UID/hotkey in miner.env"
+    },
+    {
+      "agent_id": "0",
+      "label": "deploy-kappa-fast-1.0",
+      "deployment": "kappa-fast-1.0.0",
+      "run_script": "run_deploy_kappa_fast.sh",
+      "note": "AscendKappaFastAgent — rocket cadence + surge PnL gates; set UID/hotkey in miner.env"
     }
   ]
 }
