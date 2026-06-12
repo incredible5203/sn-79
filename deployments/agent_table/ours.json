@@ -38,7 +38,21 @@
       "label": "deploy-predictive-maker-1.0",
       "deployment": "predictive-maker-1.0.0",
       "run_script": "run_deploy_predictive_maker.sh",
-      "note": "PredictiveMakerAgent Option A — set EXPECTED_UID in miner.env before deploy; 24h pass: penalty=0, kappa>=0.504, realized>0"
+      "note": "PredictiveMakerAgent predict-1.1.0 — post-only completions, 4-tick edge, 8 books/tick; 24h pass: penalty=0, kappa>=0.504, realized>0"
+    },
+    {
+      "agent_id": "pending",
+      "label": "deploy-adaptive-steady-1.0",
+      "deployment": "adaptive-steady-1.0.0",
+      "run_script": "run_deploy_adaptive_steady.sh",
+      "note": "AdaptiveSteadyMaker Option B — inside-spread + microprice; set EXPECTED_UID before deploy"
+    },
+    {
+      "agent_id": "pending",
+      "label": "deploy-microprice-momentum-1.0",
+      "deployment": "microprice-momentum-1.0.0",
+      "run_script": "run_deploy_microprice_momentum.sh",
+      "note": "MicropriceMomentumMaker Option C — directional skip-if-unclear; set EXPECTED_UID before deploy"
     }
   ]
 }

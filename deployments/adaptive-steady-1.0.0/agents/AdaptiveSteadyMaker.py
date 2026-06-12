@@ -1,9 +1,8 @@
-# PredictiveMakerAgent — SN-79 Option A (touch-join + OFI/microprice signals)
+# AdaptiveSteadyMaker — SN-79 Option B (inside-spread + microprice-only bias)
 from __future__ import annotations
 
 import os
 import sys
-from collections import defaultdict
 
 _agent_dir = os.path.dirname(os.path.abspath(__file__))
 if _agent_dir not in sys.path:
@@ -11,7 +10,18 @@ if _agent_dir not in sys.path:
 
 import bittensor as bt
 
-from _predictive_signals import BookHealth, CompletionHint, SignalEngine
+from _adaptive_signals import MicropriceSignalEngine
+from _maker_common import (
+    BookHealth,
+    CompletionHint,
+    InstructionBudget,
+    completion_price,
+    free_qty,
+    inventory_skew,
+    param_bool,
+    round_price,
+    round_qty,
+)
 from taos.common.agents import launch
 from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
@@ -19,45 +29,10 @@ from taos.im.protocol.events import TradeEvent
 from taos.im.protocol.instructions import OrderDirection, TimeInForce
 
 
-def _param_bool(val, default: bool = False) -> bool:
-    if val is None:
-        return default
-    if isinstance(val, bool):
-        return val
-    try:
-        return float(val) != 0.0
-    except (TypeError, ValueError):
-        return default
+class AdaptiveSteadyMaker(FinanceSimulationAgent):
+    """Option B: inside-spread maker with microprice-only side selection."""
 
-
-class _InstructionBudget:
-    def __init__(self, total: int, per_book: int):
-        self._total_cap = int(total)
-        self._per_book = int(per_book)
-        self._used = 0
-        self._book_used: dict[int, int] = defaultdict(int)
-
-    def ok(self, book_id: int, n: int = 1) -> bool:
-        used = self._book_used[book_id]
-        return self._used + n <= self._total_cap and used + n <= self._per_book
-
-    def use(self, book_id: int, n: int = 1) -> None:
-        self._used += n
-        self._book_used[book_id] += n
-
-    @property
-    def remaining(self) -> int:
-        return self._total_cap - self._used
-
-
-class PredictiveMakerAgent(FinanceSimulationAgent):
-    """
-    Option A from SN-79-prediction-agent-strategy-guide:
-    touch-join maker + combined microstructure signal for side selection,
-    completion-first round-trips, 12-bucket rotation for penalty=0.
-    """
-
-    agent_label = "PredictiveMakerAgent"
+    agent_label = "AdaptiveSteadyMaker"
 
     def initialize(self) -> None:
         self.history_len = 0
@@ -67,49 +42,35 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
             getattr(self.config, "max_total_instructions", 28)
         )
         self.max_per_book = int(getattr(self.config, "max_instructions_per_book", 4))
-        self.min_spread_ticks = float(getattr(self.config, "min_spread_ticks", 4.0))
-        self.max_spread_ratio = float(getattr(self.config, "max_spread_ratio", 0.003))
-        self.max_maker_fee = float(getattr(self.config, "max_fee_rate", 0.0014))
-        self.max_tape_imbalance = float(
-            getattr(self.config, "max_tape_imbalance", 0.75)
-        )
+        self.min_spread_ticks = float(getattr(self.config, "min_spread_ticks", 5.0))
+        self.max_spread_ratio = float(getattr(self.config, "max_spread_ratio", 0.002))
+        self.max_maker_fee = float(getattr(self.config, "max_fee_rate", 0.0013))
         self.base_quantity = float(getattr(self.config, "min_quantity", 0.32))
-        self.min_quantity = float(getattr(self.config, "min_quantity", 0.32))
+        self.min_quantity = float(getattr(self.config, "min_quantity", 0.25))
         self.quantity_scale = float(getattr(self.config, "quantity_scale", 1.0))
-        self.signal_threshold_strong = float(
-            getattr(self.config, "signal_threshold_strong", 0.15)
-        )
-        self.signal_threshold_weak = float(
-            getattr(self.config, "signal_threshold_weak", 0.08)
-        )
-        self.signal_adverse_skip = float(
-            getattr(self.config, "signal_adverse_skip", 0.50)
-        )
+        self.inside_ticks = int(getattr(self.config, "inside_ticks", 1))
+        self.micro_threshold = float(getattr(self.config, "micro_threshold", 0.5))
         self.signal_ewm_alpha = float(getattr(self.config, "signal_ewm_alpha", 0.30))
         self.min_rt_edge_ticks = float(
-            getattr(self.config, "min_completion_rt_edge_ticks", 4.0)
+            getattr(self.config, "min_completion_rt_edge_ticks", 3.0)
         )
         self.completion_max_age_ns = int(
             getattr(self.config, "completion_max_age_ns", 12_000_000_000)
         )
         self.expiry_period = int(getattr(self.config, "expiry_period", 180_000_000_000))
         self.inventory_hard = float(getattr(self.config, "inventory_skew_hard", 0.20))
-        self.inventory_soft = float(getattr(self.config, "inventory_skew_soft", 0.08))
-        self.stale_ticks_outside = int(getattr(self.config, "stale_ticks_outside", 2))
-        self.stale_age_ns = int(getattr(self.config, "stale_age_ns", 7_000_000_000))
+        self.inventory_soft = float(getattr(self.config, "inventory_skew_soft", 0.10))
+        self.stale_ticks_outside = int(getattr(self.config, "stale_ticks_outside", 3))
+        self.stale_age_ns = int(getattr(self.config, "stale_age_ns", 8_000_000_000))
         self.repay_loans_per_tick = int(getattr(self.config, "repay_loans_per_tick", 1))
-        self.blacklist_after_losses = int(
-            getattr(self.config, "blacklist_after_losses", 3)
-        )
-        self.blacklist_duration = int(getattr(self.config, "blacklist_duration", 20))
         self.max_blacklisted_books = int(
             getattr(self.config, "max_blacklisted_books", 46)
         )
-        self.cancel_all_on_startup = _param_bool(
+        self.cancel_all_on_startup = param_bool(
             getattr(self.config, "cancel_all_on_startup", 1), True
         )
 
-        self._signal = SignalEngine(alpha=self.signal_ewm_alpha)
+        self._signal = MicropriceSignalEngine(alpha=self.signal_ewm_alpha)
         self._completions: dict[int, CompletionHint] = {}
         self._book_health: dict[int, BookHealth] = {}
         self._tick = 0
@@ -118,9 +79,8 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
 
         bt.logging.info(
             f"{self.agent_label} | rot={self.rotation_groups} books/tick={self.max_books_per_tick} "
-            f"min_spread={self.min_spread_ticks} min_rt_edge={self.min_rt_edge_ticks} "
-            f"signal_strong={self.signal_threshold_strong} qty={self.base_quantity} "
-            f"cancel_all_on_startup={self.cancel_all_on_startup}"
+            f"min_spread={self.min_spread_ticks} inside={self.inside_ticks} "
+            f"min_rt_edge={self.min_rt_edge_ticks} qty={self.base_quantity}"
         )
 
     def onTrade(self, event: TradeEvent, validator: str = None) -> None:
@@ -129,9 +89,7 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
         book_id = event.bookId
         if book_id in self._completions:
             return
-        comp_side = (
-            OrderDirection.BUY if event.side == 0 else OrderDirection.SELL
-        )
+        comp_side = OrderDirection.BUY if event.side == 0 else OrderDirection.SELL
         self._completions[book_id] = CompletionHint(
             book_id=book_id,
             side="BUY" if comp_side == OrderDirection.BUY else "SELL",
@@ -145,20 +103,20 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
         book_id = getattr(event, "bookId", None)
         if book_id is None or "loan" not in msg:
             return
-        bh = self._book_health.setdefault(book_id, BookHealth())
         if self._blacklist_count() < self.max_blacklisted_books:
-            bh.blacklist_until = self._tick + 15
+            self._book_health.setdefault(book_id, BookHealth()).blacklist_until = (
+                self._tick + 15
+            )
 
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
         response = FinanceAgentResponse(agent_id=self.uid)
         if not self.simulation_config:
             return response
 
-        cfg = self.simulation_config
-        pdec = cfg.priceDecimals
-        vdec = cfg.volumeDecimals
+        pdec = self.simulation_config.priceDecimals
+        vdec = self.simulation_config.volumeDecimals
         tick = 10.0 ** (-pdec)
-        budget = _InstructionBudget(self.max_total_instructions, self.max_per_book)
+        budget = InstructionBudget(self.max_total_instructions, self.max_per_book)
 
         if not self._startup_cancel_done:
             self._startup_cancel_all(response)
@@ -170,8 +128,8 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
         self._repay_loans(response, budget)
         self._cancel_stale(state, response, budget, tick)
         self._place_completions(state, response, budget, tick, pdec, vdec)
-        self._flatten_inventory(state, response, budget, tick, pdec, vdec)
-        self._place_predictive_quotes(state, response, budget, tick, pdec, vdec)
+        self._flatten_inventory(state, response, budget, pdec, vdec)
+        self._place_inside_quotes(state, response, budget, tick, pdec, vdec)
 
         self._tick += 1
         self._bucket = (self._bucket + 1) % max(self.rotation_groups, 1)
@@ -197,7 +155,7 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
             1 for bh in self._book_health.values() if bh.blacklist_until > self._tick
         )
 
-    def _repay_loans(self, response: FinanceAgentResponse, budget: _InstructionBudget):
+    def _repay_loans(self, response: FinanceAgentResponse, budget: InstructionBudget):
         repaid = 0
         for book_id, account in self.accounts.items():
             if repaid >= self.repay_loans_per_tick or not budget.ok(book_id):
@@ -211,7 +169,7 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
         self,
         state: MarketSimulationStateUpdate,
         response: FinanceAgentResponse,
-        budget: _InstructionBudget,
+        budget: InstructionBudget,
         tick: float,
     ) -> None:
         cancelled = 0
@@ -242,67 +200,13 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
 
     def _round_qty(self, qty: float, vdec: int) -> float:
         qty = max(self.min_quantity, qty * self.quantity_scale)
-        return round(qty, vdec)
-
-    def _round_price(self, price: float, pdec: int) -> float:
-        return round(price, pdec)
-
-    def _inventory_skew(self, account, mid: float) -> float:
-        bv = account.base_balance.total * mid
-        qv = account.quote_balance.total
-        tv = bv + qv
-        return (bv - qv) / max(tv, 1.0)
-
-    def _free_qty(
-        self, side: OrderDirection, qty: float, price: float, account
-    ) -> float:
-        if side == OrderDirection.BUY:
-            avail = account.quote_balance.free
-            if avail < qty * price:
-                qty = avail / max(price, 1e-9)
-        else:
-            qty = min(qty, account.base_balance.free)
-        return qty if qty >= self.min_quantity else 0.0
-
-    def _completion_price(
-        self,
-        hint: CompletionHint,
-        bid_p: float,
-        ask_p: float,
-        tick: float,
-        pdec: int,
-    ) -> tuple[OrderDirection, float] | None:
-        """Post-only completion inside spread; None if min edge cannot be met."""
-        edge = self.min_rt_edge_ticks * tick
-        if ask_p - bid_p < 2 * tick:
-            return None
-
-        if hint.side == "BUY":
-            trade_dir = OrderDirection.BUY
-            cap = self._round_price(ask_p - tick, pdec)
-            target = self._round_price(hint.fill_price - edge, pdec)
-            price = min(target, cap)
-            if price < bid_p:
-                price = self._round_price(bid_p, pdec)
-            if price >= ask_p or (hint.fill_price - price) < edge * 0.99:
-                return None
-            return trade_dir, price
-
-        trade_dir = OrderDirection.SELL
-        floor = self._round_price(bid_p + tick, pdec)
-        target = self._round_price(hint.fill_price + edge, pdec)
-        price = max(target, floor)
-        if price > ask_p:
-            price = self._round_price(ask_p, pdec)
-        if price <= bid_p or (price - hint.fill_price) < edge * 0.99:
-            return None
-        return trade_dir, price
+        return round_qty(qty, vdec)
 
     def _place_completions(
         self,
         state: MarketSimulationStateUpdate,
         response: FinanceAgentResponse,
-        budget: _InstructionBudget,
+        budget: InstructionBudget,
         tick: float,
         pdec: int,
         vdec: int,
@@ -316,18 +220,18 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
             if not book or not account or not book.bids or not book.asks:
                 continue
             bid_p, ask_p = book.bids[0].price, book.asks[0].price
-            age_ns = state.timestamp - hint.queued_ts_ns
-            if age_ns > self.completion_max_age_ns:
+            if state.timestamp - hint.queued_ts_ns > self.completion_max_age_ns:
                 done.append(book_id)
                 continue
 
-            qty = self._round_qty(max(hint.fill_qty, self.min_quantity), vdec)
-            priced = self._completion_price(hint, bid_p, ask_p, tick, pdec)
+            priced = completion_price(
+                hint, bid_p, ask_p, tick, pdec, self.min_rt_edge_ticks
+            )
             if priced is None:
                 continue
             trade_dir, price = priced
-
-            qty = self._free_qty(trade_dir, qty, price, account)
+            qty = self._round_qty(max(hint.fill_qty, self.min_quantity), vdec)
+            qty = free_qty(trade_dir, qty, price, account, self.min_quantity)
             if qty < self.min_quantity:
                 continue
 
@@ -350,8 +254,7 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
         self,
         state: MarketSimulationStateUpdate,
         response: FinanceAgentResponse,
-        budget: _InstructionBudget,
-        tick: float,
+        budget: InstructionBudget,
         pdec: int,
         vdec: int,
     ) -> None:
@@ -363,38 +266,41 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
                 continue
             bid_p, ask_p = book.bids[0].price, book.asks[0].price
             mid = (bid_p + ask_p) * 0.5
-            skew = self._inventory_skew(account, mid)
+            skew = inventory_skew(account, mid)
             if abs(skew) <= self.inventory_hard:
                 continue
 
             if skew > self.inventory_hard:
                 trade_dir = OrderDirection.SELL
-                price = self._round_price(ask_p, pdec)
-                qty = self._round_qty(max(account.base_balance.free * 0.25, self.min_quantity), vdec)
+                price = round_price(ask_p, pdec)
+                qty = self._round_qty(
+                    max(account.base_balance.free * 0.25, self.min_quantity), vdec
+                )
             else:
                 trade_dir = OrderDirection.BUY
-                price = self._round_price(bid_p, pdec)
+                price = round_price(bid_p, pdec)
                 qty = self._round_qty(
-                    max(account.quote_balance.free * 0.25 / max(ask_p, 1e-9), self.min_quantity),
+                    max(
+                        account.quote_balance.free * 0.25 / max(ask_p, 1e-9),
+                        self.min_quantity,
+                    ),
                     vdec,
                 )
-            qty = self._free_qty(trade_dir, qty, price, account)
+            qty = free_qty(trade_dir, qty, price, account, self.min_quantity)
             if qty < self.min_quantity:
                 continue
             if trade_dir == OrderDirection.BUY and price >= ask_p:
                 continue
             if trade_dir == OrderDirection.SELL and price <= bid_p:
                 continue
-            response.limit_order(
-                book_id, trade_dir, qty, price, postOnly=True
-            )
+            response.limit_order(book_id, trade_dir, qty, price, postOnly=True)
             budget.use(book_id)
 
-    def _place_predictive_quotes(
+    def _place_inside_quotes(
         self,
         state: MarketSimulationStateUpdate,
         response: FinanceAgentResponse,
-        budget: _InstructionBudget,
+        budget: InstructionBudget,
         tick: float,
         pdec: int,
         vdec: int,
@@ -402,14 +308,13 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
         book_count = self.simulation_config.book_count
         placed = 0
         candidates: list[tuple] = []
+        micro_cutoff = self.micro_threshold * 0.25
 
         for book_id in range(book_count):
             if book_id % self.rotation_groups != self._bucket:
                 continue
             bh = self._book_health.setdefault(book_id, BookHealth())
-            if bh.blacklist_until > self._tick:
-                continue
-            if book_id in self._completions:
+            if bh.blacklist_until > self._tick or book_id in self._completions:
                 continue
 
             book = state.books.get(book_id)
@@ -422,104 +327,79 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
             spread = ask_p - bid_p
             if mid <= 0 or spread <= 0:
                 continue
+
             spread_ticks = spread / tick
             if spread_ticks < self.min_spread_ticks:
                 continue
             if spread / mid > self.max_spread_ratio:
                 continue
+            if spread_ticks < (2 * self.inside_ticks + 1):
+                continue
             try:
-                if account.fees.maker_fee_rate > self.max_maker_fee:
+                if account.fees.maker_fee_rate >= self.max_maker_fee:
                     continue
             except Exception:
                 pass
 
-            buy_vol = sell_vol = 0.0
-            for ev in book.events:
-                if getattr(ev, "y", None) == "t":
-                    q = float(getattr(ev, "quantity", 0.0))
-                    s = getattr(ev, "side", -1)
-                    if s == 0:
-                        buy_vol += q
-                    elif s == 1:
-                        sell_vol += q
-            total = buy_vol + sell_vol
-            imb = abs(buy_vol - sell_vol) / max(total, 1e-9)
-            if imb > self.max_tape_imbalance:
-                continue
-
             signal = self._signal.compute(book_id, book)
-            skew = self._inventory_skew(account, mid)
+            skew = inventory_skew(account, mid)
             score = (
-                0.4 * min(spread_ticks / 8.0, 1.0)
+                0.5 * min(spread_ticks / 8.0, 1.0)
                 + 0.3 * abs(signal)
-                + 0.2 * (1.0 - imb)
-                + 0.1
+                + 0.2
                 * (
                     account.quote_balance.free
                     / max(account.quote_balance.total, 1.0)
                 )
             )
-            candidates.append(
-                (score, book_id, bid_p, ask_p, mid, signal, skew, account, imb)
-            )
+            candidates.append((score, book_id, bid_p, ask_p, signal, skew, account))
 
         candidates.sort(key=lambda x: -x[0])
 
-        for score, book_id, bid_p, ask_p, mid, signal, skew, account, imb in candidates:
+        for score, book_id, bid_p, ask_p, signal, skew, account in candidates:
             if placed >= self.max_books_per_tick or budget.remaining <= 0:
                 break
             if not budget.ok(book_id):
                 continue
 
-            if signal > self.signal_threshold_strong:
+            if signal > micro_cutoff:
                 trade_dir = OrderDirection.SELL
-                price = self._round_price(ask_p, pdec)
-            elif signal < -self.signal_threshold_strong:
+                price = round_price(ask_p - self.inside_ticks * tick, pdec)
+            elif signal < -micro_cutoff:
                 trade_dir = OrderDirection.BUY
-                price = self._round_price(bid_p, pdec)
+                price = round_price(bid_p + self.inside_ticks * tick, pdec)
             elif skew > self.inventory_soft:
                 trade_dir = OrderDirection.SELL
-                price = self._round_price(ask_p, pdec)
+                price = round_price(ask_p - self.inside_ticks * tick, pdec)
             elif skew < -self.inventory_soft:
                 trade_dir = OrderDirection.BUY
-                price = self._round_price(bid_p, pdec)
-            elif signal > self.signal_threshold_weak:
-                trade_dir = OrderDirection.SELL
-                price = self._round_price(ask_p, pdec)
-            elif signal < -self.signal_threshold_weak:
-                trade_dir = OrderDirection.BUY
-                price = self._round_price(bid_p, pdec)
+                price = round_price(bid_p + self.inside_ticks * tick, pdec)
             else:
                 trade_dir = (
                     OrderDirection.SELL
                     if (book_id + self._tick) % 2 == 0
                     else OrderDirection.BUY
                 )
-                price = self._round_price(
-                    ask_p if trade_dir == OrderDirection.SELL else bid_p, pdec
+                price = round_price(
+                    ask_p - self.inside_ticks * tick
+                    if trade_dir == OrderDirection.SELL
+                    else bid_p + self.inside_ticks * tick,
+                    pdec,
                 )
 
-            if abs(signal) > self.signal_adverse_skip:
-                if signal > 0 and trade_dir == OrderDirection.BUY:
-                    continue
-                if signal < 0 and trade_dir == OrderDirection.SELL:
-                    continue
-
             qty = self._round_qty(self.base_quantity, vdec)
-            qty = self._free_qty(trade_dir, qty, price, account)
+            qty = free_qty(trade_dir, qty, price, account, self.min_quantity)
             if qty < self.min_quantity:
                 continue
-
+            if trade_dir == OrderDirection.BUY and price >= ask_p:
+                continue
+            if trade_dir == OrderDirection.SELL and price <= bid_p:
+                continue
             try:
                 if price in {o.price for o in account.orders}:
                     continue
             except Exception:
                 pass
-
-            if trade_dir == OrderDirection.BUY and price >= ask_p:
-                continue
-            if trade_dir == OrderDirection.SELL and price <= bid_p:
-                continue
 
             response.limit_order(
                 book_id,
@@ -534,4 +414,4 @@ class PredictiveMakerAgent(FinanceSimulationAgent):
 
 
 if __name__ == "__main__":
-    launch(PredictiveMakerAgent)
+    launch(AdaptiveSteadyMaker)
