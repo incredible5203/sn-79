@@ -24,14 +24,14 @@
       "label": "deploy-predict-1.0",
       "deployment": "predict-1.0.0",
       "run_script": "run_deploy_predict.sh",
-      "note": "AscendPredictAgent — surge + PassiveAggressive overlay; set UID/hotkey in miner.env"
+      "note": "AscendPredictAgent predict-1.1.0 — surge + PA overlay + veto; 24h pass: penalty=0, realized>0, kappa>=0.504"
     },
     {
       "agent_id": "51",
       "label": "deploy-kappa-fast-1.0",
       "deployment": "kappa-fast-1.0.0",
       "run_script": "run_deploy_kappa_fast.sh",
-      "note": "AscendKappaFastAgent — rocket cadence + surge PnL gates; set UID/hotkey in miner.env"
+      "note": "AscendKappaFastAgent — Option C test UID; 24h pass: penalty=0, kappa>=0.504 rising, realized>0, min_rt>3k"
     }
   ]
 }

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -27,6 +28,14 @@ if TYPE_CHECKING:
     from taos.im.protocol.models import Book
 
 
+@dataclass(frozen=True)
+class PredictOverlayResult:
+    """Per-tick overlay outputs for ascend_score_tick."""
+
+    book_quote_qty: dict[int, float]
+    book_pred_sign: dict[int, int]
+
+
 class PredictOverlay:
     """Per-book online regressor + skew-aware quantity policy."""
 
@@ -38,16 +47,22 @@ class PredictOverlay:
         volume_decimals: int,
         inventory_skew_soft: float,
         predict_threshold: float = 0.002,
+        veto_threshold: float | None = None,
         agree_size_k: float = 0.5,
         predict_max_books: int = 13,
         time_budget_ms: float = 400.0,
         min_train_samples: int = 8,
+        veto_enabled: bool = True,
     ) -> None:
         self.base_quantity = base_quantity
         self.max_quantity = max_quantity
         self.volume_decimals = volume_decimals
         self.inventory_skew_soft = inventory_skew_soft
         self.predict_threshold = predict_threshold
+        self.veto_threshold = (
+            veto_threshold if veto_threshold is not None else predict_threshold
+        )
+        self.veto_enabled = veto_enabled
         self.agree_size_k = agree_size_k
         self.predict_max_books = predict_max_books
         self.time_budget_ms = time_budget_ms
@@ -162,17 +177,17 @@ class PredictOverlay:
                     model.partial_fit(prev_x.reshape(1, -1), np.array([y]))
         self._prev[book_id] = (features, mid)
 
-    def book_quote_qty(
+    def overlay(
         self,
         state,
         accounts,
         simulation_config,
         last_mid: dict[int, float],
-    ) -> dict[int, float]:
+    ) -> PredictOverlayResult:
         t0 = time.perf_counter()
         pdec = simulation_config.priceDecimals
         tick = tick_size(pdec)
-        candidates: list[tuple[float, int, float, int, float]] = []
+        candidates: list[tuple[float, int, float, int, float, int]] = []
 
         for book_id, book in state.books.items():
             if book_id not in accounts:
@@ -201,7 +216,15 @@ class PredictOverlay:
 
             spread_ticks = (ask - bid) / tick if tick > 0 else 0.0
             rank = spread_ticks + abs(pred_val) * 100.0
-            candidates.append((rank, book_id, pred_val, pred_s, skew_s))
+            veto_s = 0
+            if (
+                self.veto_enabled
+                and n >= self.min_train_samples
+                and abs(pred_val) >= self.veto_threshold
+            ):
+                veto_s = self._direction_sign(pred_val, self.veto_threshold)
+
+            candidates.append((rank, book_id, pred_val, pred_s, skew_s, veto_s))
 
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if elapsed_ms > self.time_budget_ms:
@@ -211,9 +234,12 @@ class PredictOverlay:
         candidates.sort(key=lambda x: -x[0])
         selected = candidates[: max(1, self.predict_max_books)]
 
-        out: dict[int, float] = {}
-        for _rank, book_id, pred_val, pred_s, skew_s in selected:
-            out[book_id] = self._quantity_policy(pred_s, skew_s, pred_val)
+        qty_out: dict[int, float] = {}
+        veto_out: dict[int, int] = {}
+        for _rank, book_id, pred_val, pred_s, skew_s, veto_s in selected:
+            qty_out[book_id] = self._quantity_policy(pred_s, skew_s, pred_val)
+            if veto_s != 0:
+                veto_out[book_id] = veto_s
 
         self._last_ms = (time.perf_counter() - t0) * 1000.0
-        return out
+        return PredictOverlayResult(book_quote_qty=qty_out, book_pred_sign=veto_out)

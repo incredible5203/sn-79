@@ -1608,6 +1608,7 @@ def ascend_score_tick(
     max_touch_per_tick: int = 8,
     max_cold_books_per_tick: int = 4,
     book_quote_qty: dict[int, float] | None = None,
+    book_pred_sign: dict[int, int] | None = None,
 ) -> None:
     """
     Ascend scoring engine — fast κ growth, Penalty → 0, positive realized PnL.
@@ -1712,6 +1713,18 @@ def ascend_score_tick(
             capped = max(min_quantity, min(float(book_quote_qty[book_id]), max_quantity))
             return sim_order_qty(min_quantity, capped, 1.0, vdec)
         return base_qty
+
+    def _pred_vetoes_new_quote(book_id: int, trade_dir: OrderDirection) -> bool:
+        if not book_pred_sign:
+            return False
+        pred_sign = book_pred_sign.get(book_id, 0)
+        if pred_sign == 0:
+            return False
+        if pred_sign == 1 and trade_dir == OrderDirection.SELL:
+            return True
+        if pred_sign == -1 and trade_dir == OrderDirection.BUY:
+            return True
+        return False
 
     placed: set[int] = set()
 
@@ -1902,6 +1915,8 @@ def ascend_score_tick(
                     if (book_id + rot) % 2 == 0
                     else OrderDirection.SELL
                 )
+            if _pred_vetoes_new_quote(book_id, trade_dir):
+                continue
             price = _limit_price(
                 trade_dir, best_bid, best_ask, tick, pdec, mode="join_touch"
             )
@@ -2012,6 +2027,8 @@ def ascend_score_tick(
                 and buy_price < sell_price
                 and account.quote_balance.free >= qty * buy_price
                 and account.base_balance.free >= qty
+                and not _pred_vetoes_new_quote(book_id, OrderDirection.BUY)
+                and not _pred_vetoes_new_quote(book_id, OrderDirection.SELL)
             ):
                 place_limit(
                     response, book_id, OrderDirection.BUY, qty, buy_price,
@@ -2052,6 +2069,8 @@ def ascend_score_tick(
                 else OrderDirection.SELL
             )
         else:
+            continue
+        if _pred_vetoes_new_quote(book_id, trade_dir):
             continue
         rt_edge = _rt_edge_ticks(best_bid, best_ask, tick, pdec)
         quote_mode = (
@@ -2133,6 +2152,8 @@ def ascend_score_tick(
                     if (book_id + rot) % 2 == 0
                     else OrderDirection.SELL
                 )
+            if _pred_vetoes_new_quote(book_id, trade_dir):
+                continue
             price = _limit_price(
                 trade_dir, best_bid, best_ask, tick, pdec,
                 mode="inside", depth_ticks=depth,
@@ -2207,6 +2228,8 @@ def ascend_score_tick(
             elif spread_ticks >= quote_spread_floor:
                 mode = "inside"
             else:
+                continue
+            if _pred_vetoes_new_quote(book_id, trade_dir):
                 continue
             price = _limit_price(
                 trade_dir, best_bid, best_ask, tick, pdec, mode=mode, depth_ticks=base_depth

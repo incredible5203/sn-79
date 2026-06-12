@@ -1,4 +1,4 @@
-# AscendPredictAgent — Ascend surge/rocket + CPU prediction & skew-aware sizing
+# AscendPredictAgent — Ascend surge + CPU prediction overlay + veto layer
 from __future__ import annotations
 
 import os
@@ -22,8 +22,8 @@ class AscendPredictAgent(AscendAgent):
     """
     Extends AscendAgent with a lightweight sklearn overlay:
       - PassiveAggressiveRegressor per book (next-tick log return)
+      - Veto: skip new quotes when prediction disagrees with intended side
       - If prediction and inventory skew agree → size up (capped)
-      - If they disagree → base quantity (skew-safe)
       - Completions / flatten legs remain base size (inside ascend_score_tick)
     """
 
@@ -35,6 +35,10 @@ class AscendPredictAgent(AscendAgent):
         self.predict_threshold = float(
             getattr(self.config, "predict_threshold", 0.002)
         )
+        self.predict_veto_threshold = float(
+            getattr(self.config, "predict_veto_threshold", self.predict_threshold)
+        )
+        self.predict_veto = int(getattr(self.config, "predict_veto", 1)) != 0
         self.agree_size_k = float(getattr(self.config, "agree_size_k", 0.5))
         self.predict_max_books = int(getattr(self.config, "predict_max_books", 13))
         self.predict_time_budget_ms = float(
@@ -43,6 +47,7 @@ class AscendPredictAgent(AscendAgent):
         self._overlay: PredictOverlay | None = None
         bt.logging.info(
             f"{self.agent_label} | predict_threshold={self.predict_threshold} "
+            f"veto={self.predict_veto} veto_threshold={self.predict_veto_threshold} "
             f"agree_size_k={self.agree_size_k} max_books={self.predict_max_books} "
             f"time_budget_ms={self.predict_time_budget_ms}"
         )
@@ -55,9 +60,11 @@ class AscendPredictAgent(AscendAgent):
                 volume_decimals=int(self.simulation_config.volumeDecimals),
                 inventory_skew_soft=self.inventory_skew_soft,
                 predict_threshold=self.predict_threshold,
+                veto_threshold=self.predict_veto_threshold,
                 agree_size_k=self.agree_size_k,
                 predict_max_books=self.predict_max_books,
                 time_budget_ms=self.predict_time_budget_ms,
+                veto_enabled=self.predict_veto,
             )
         return self._overlay
 
@@ -68,7 +75,7 @@ class AscendPredictAgent(AscendAgent):
         self._decay_requote()
 
         t0 = time.perf_counter()
-        book_quote_qty = self._ensure_overlay().book_quote_qty(
+        overlay = self._ensure_overlay().overlay(
             state,
             self.accounts,
             self.simulation_config,
@@ -117,14 +124,16 @@ class AscendPredictAgent(AscendAgent):
             touch_join_spread_ticks=self.touch_join_spread_ticks,
             max_touch_per_tick=self.max_touch_per_tick,
             max_cold_books_per_tick=self.max_cold_books_per_tick,
-            book_quote_qty=book_quote_qty,
+            book_quote_qty=overlay.book_quote_qty,
+            book_pred_sign=overlay.book_pred_sign,
         )
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         if total_ms > 500.0:
             bt.logging.warning(
                 f"{self.agent_label} slow tick: overlay={overlay_ms:.1f}ms "
-                f"total={total_ms:.1f}ms books_sized={len(book_quote_qty)}"
+                f"total={total_ms:.1f}ms books_sized={len(overlay.book_quote_qty)} "
+                f"veto_books={len(overlay.book_pred_sign)}"
             )
         return response
 
