@@ -25,6 +25,13 @@
       "deployment": "hybrid-1.0.0",
       "run_script": "run_deploy_hybrid.sh",
       "note": "AscendPulseAgent rocket (UID 65 parity); cancel_all on startup for PnL recovery"
+    },
+    {
+      "agent_id": "127",
+      "label": "deploy-predict-1.0",
+      "deployment": "predict-1.0.0",
+      "run_script": "run_deploy_predict.sh",
+      "note": "AscendPredictAgent — surge + PassiveAggressive overlay; set UID/hotkey in miner.env"
     }
   ]
 }
