@@ -17,7 +17,10 @@ from _maker_common import (
     InstructionBudget,
     completion_price,
     free_qty,
+    has_open_order_near,
+    inside_quote_price,
     inventory_skew,
+    min_spread_ticks_for_rt,
     param_bool,
     round_price,
     round_qty,
@@ -36,32 +39,44 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
 
     def initialize(self) -> None:
         self.history_len = 0
-        self.rotation_groups = int(getattr(self.config, "rotation_groups", 12))
-        self.max_books_per_tick = int(getattr(self.config, "max_books_per_tick", 11))
+        self.rotation_groups = int(getattr(self.config, "rotation_groups", 8))
+        self.max_books_per_tick = int(getattr(self.config, "max_books_per_tick", 10))
+        self.max_completions_per_tick = int(
+            getattr(self.config, "max_completions_per_tick", 6)
+        )
         self.max_total_instructions = int(
             getattr(self.config, "max_total_instructions", 28)
         )
         self.max_per_book = int(getattr(self.config, "max_instructions_per_book", 4))
         self.min_spread_ticks = float(getattr(self.config, "min_spread_ticks", 5.0))
-        self.max_spread_ratio = float(getattr(self.config, "max_spread_ratio", 0.002))
+        self.max_spread_ratio = float(getattr(self.config, "max_spread_ratio", 0.003))
         self.max_maker_fee = float(getattr(self.config, "max_fee_rate", 0.0013))
         self.base_quantity = float(getattr(self.config, "min_quantity", 0.32))
         self.min_quantity = float(getattr(self.config, "min_quantity", 0.25))
         self.quantity_scale = float(getattr(self.config, "quantity_scale", 1.0))
         self.inside_ticks = int(getattr(self.config, "inside_ticks", 1))
-        self.micro_threshold = float(getattr(self.config, "micro_threshold", 0.5))
+        self.micro_threshold = float(getattr(self.config, "micro_threshold", 0.35))
         self.signal_ewm_alpha = float(getattr(self.config, "signal_ewm_alpha", 0.30))
         self.min_rt_edge_ticks = float(
             getattr(self.config, "min_completion_rt_edge_ticks", 3.0)
         )
+        self.flatten_max_qty_mult = float(
+            getattr(self.config, "flatten_max_qty_mult", 2.0)
+        )
         self.completion_max_age_ns = int(
             getattr(self.config, "completion_max_age_ns", 12_000_000_000)
         )
+        self.completion_place_cooldown_ns = int(
+            getattr(self.config, "completion_place_cooldown_ns", 2_000_000_000)
+        )
+        self.completion_max_attempts = int(
+            getattr(self.config, "completion_max_attempts", 24)
+        )
         self.expiry_period = int(getattr(self.config, "expiry_period", 180_000_000_000))
-        self.inventory_hard = float(getattr(self.config, "inventory_skew_hard", 0.20))
-        self.inventory_soft = float(getattr(self.config, "inventory_skew_soft", 0.10))
-        self.stale_ticks_outside = int(getattr(self.config, "stale_ticks_outside", 3))
-        self.stale_age_ns = int(getattr(self.config, "stale_age_ns", 8_000_000_000))
+        self.inventory_hard = float(getattr(self.config, "inventory_skew_hard", 0.15))
+        self.inventory_soft = float(getattr(self.config, "inventory_skew_soft", 0.08))
+        self.stale_ticks_outside = int(getattr(self.config, "stale_ticks_outside", 2))
+        self.stale_age_ns = int(getattr(self.config, "stale_age_ns", 7_000_000_000))
         self.repay_loans_per_tick = int(getattr(self.config, "repay_loans_per_tick", 1))
         self.max_blacklisted_books = int(
             getattr(self.config, "max_blacklisted_books", 46)
@@ -79,20 +94,33 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
 
         bt.logging.info(
             f"{self.agent_label} | rot={self.rotation_groups} books/tick={self.max_books_per_tick} "
-            f"min_spread={self.min_spread_ticks} inside={self.inside_ticks} "
-            f"min_rt_edge={self.min_rt_edge_ticks} qty={self.base_quantity}"
+            f"completions/tick={self.max_completions_per_tick} min_spread={self.min_spread_ticks} "
+            f"inside={self.inside_ticks} min_rt_edge={self.min_rt_edge_ticks} qty={self.base_quantity}"
         )
+
+    def _completion_side(self, event: TradeEvent) -> str:
+        # Taker side: 0=bought (we sold) → buy back; 1=sold (we bought) → sell back
+        return "BUY" if event.side == 0 else "SELL"
 
     def onTrade(self, event: TradeEvent, validator: str = None) -> None:
         if event.makerAgentId != self.uid:
             return
         book_id = event.bookId
-        if book_id in self._completions:
+        if book_id is None:
             return
-        comp_side = OrderDirection.BUY if event.side == 0 else OrderDirection.SELL
+
+        pending = self._completions.get(book_id)
+        if pending is not None:
+            # Completion leg filled: pending BUY filled on bid (taker sold), etc.
+            if (pending.side == "BUY" and event.side == 1) or (
+                pending.side == "SELL" and event.side == 0
+            ):
+                self._completions.pop(book_id, None)
+                return
+
         self._completions[book_id] = CompletionHint(
             book_id=book_id,
-            side="BUY" if comp_side == OrderDirection.BUY else "SELL",
+            side=self._completion_side(event),
             fill_price=float(event.price),
             fill_qty=float(event.quantity),
             queued_ts_ns=int(event.timestamp),
@@ -128,7 +156,7 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
         self._repay_loans(response, budget)
         self._cancel_stale(state, response, budget, tick)
         self._place_completions(state, response, budget, tick, pdec, vdec)
-        self._flatten_inventory(state, response, budget, pdec, vdec)
+        self._flatten_inventory(state, response, budget, tick, pdec, vdec)
         self._place_inside_quotes(state, response, budget, tick, pdec, vdec)
 
         self._tick += 1
@@ -202,6 +230,33 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
         qty = max(self.min_quantity, qty * self.quantity_scale)
         return round_qty(qty, vdec)
 
+    def _flatten_cap_qty(self) -> float:
+        return self.base_quantity * self.flatten_max_qty_mult
+
+    def _min_rt_spread_ticks(self) -> float:
+        return min_spread_ticks_for_rt(self.inside_ticks, self.min_rt_edge_ticks)
+
+    def _spread_ticks_ok(self, spread_ticks: float) -> bool:
+        return spread_ticks >= max(self.min_spread_ticks, self._min_rt_spread_ticks())
+
+    def _instruction_count(self, response: FinanceAgentResponse) -> int:
+        return len(response.instructions)
+
+    def _try_limit_order(self, response: FinanceAgentResponse, **kwargs) -> bool:
+        before = self._instruction_count(response)
+        response.limit_order(**kwargs)
+        return self._instruction_count(response) > before
+
+    def _completion_relax_ticks(self, attempts: int) -> float:
+        if attempts >= 8:
+            return max(self.min_rt_edge_ticks - 1.0, 1.0)
+        if attempts >= 4:
+            return 1.0
+        return 0.0
+
+    def _completion_post_only(self, attempts: int) -> bool:
+        return attempts < 3
+
     def _place_completions(
         self,
         state: MarketSimulationStateUpdate,
@@ -211,43 +266,80 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
         pdec: int,
         vdec: int,
     ) -> None:
-        done: list[int] = []
-        for book_id, hint in list(self._completions.items()):
+        dropped: list[int] = []
+        placed = 0
+        jobs: list[tuple] = []
+
+        for book_id, hint in self._completions.items():
+            age_ns = state.timestamp - hint.queued_ts_ns
+            if age_ns > self.completion_max_age_ns:
+                hint.attempts += 1
+                hint.queued_ts_ns = state.timestamp
+            if hint.attempts >= self.completion_max_attempts:
+                dropped.append(book_id)
+            jobs.append((age_ns, book_id, hint))
+
+        jobs.sort(key=lambda x: -x[0])
+
+        for _age_ns, book_id, hint in jobs:
+            if placed >= self.max_completions_per_tick:
+                break
             if not budget.ok(book_id):
                 continue
             book = state.books.get(book_id)
             account = self.accounts.get(book_id)
             if not book or not account or not book.bids or not book.asks:
                 continue
-            bid_p, ask_p = book.bids[0].price, book.asks[0].price
-            if state.timestamp - hint.queued_ts_ns > self.completion_max_age_ns:
-                done.append(book_id)
+
+            if (
+                hint.last_place_ts_ns
+                and state.timestamp - hint.last_place_ts_ns
+                < self.completion_place_cooldown_ns
+            ):
                 continue
 
+            bid_p, ask_p = book.bids[0].price, book.asks[0].price
+            relax = self._completion_relax_ticks(hint.attempts)
             priced = completion_price(
-                hint, bid_p, ask_p, tick, pdec, self.min_rt_edge_ticks
+                hint,
+                bid_p,
+                ask_p,
+                tick,
+                pdec,
+                self.min_rt_edge_ticks,
+                inside_ticks=self.inside_ticks,
+                relax_ticks=relax,
             )
             if priced is None:
+                hint.attempts += 1
                 continue
+
             trade_dir, price = priced
+            if has_open_order_near(account, trade_dir, price, tick):
+                continue
+
             qty = self._round_qty(max(hint.fill_qty, self.min_quantity), vdec)
             qty = free_qty(trade_dir, qty, price, account, self.min_quantity)
             if qty < self.min_quantity:
                 continue
 
-            response.limit_order(
-                book_id,
-                trade_dir,
-                qty,
-                price,
-                postOnly=True,
+            expiry = min(self.expiry_period, self.completion_max_age_ns // 2)
+            if self._try_limit_order(
+                response,
+                book_id=book_id,
+                direction=trade_dir,
+                quantity=qty,
+                price=price,
+                postOnly=self._completion_post_only(hint.attempts),
                 timeInForce=TimeInForce.GTT,
-                expiryPeriod=min(self.expiry_period, self.completion_max_age_ns // 2),
-            )
-            budget.use(book_id)
-            done.append(book_id)
+                expiryPeriod=expiry,
+            ):
+                budget.use(book_id)
+                placed += 1
+                hint.attempts += 1
+                hint.last_place_ts_ns = state.timestamp
 
-        for b in done:
+        for b in dropped:
             self._completions.pop(b, None)
 
     def _flatten_inventory(
@@ -255,9 +347,11 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
         state: MarketSimulationStateUpdate,
         response: FinanceAgentResponse,
         budget: InstructionBudget,
+        tick: float,
         pdec: int,
         vdec: int,
     ) -> None:
+        cap = self._flatten_cap_qty()
         for book_id, account in self.accounts.items():
             if not budget.ok(book_id):
                 continue
@@ -272,29 +366,38 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
 
             if skew > self.inventory_hard:
                 trade_dir = OrderDirection.SELL
-                price = round_price(ask_p, pdec)
+                price = inside_quote_price(
+                    trade_dir, bid_p, ask_p, tick, pdec, self.inside_ticks
+                )
                 qty = self._round_qty(
-                    max(account.base_balance.free * 0.25, self.min_quantity), vdec
+                    min(account.base_balance.free * 0.10, cap), vdec
                 )
             else:
                 trade_dir = OrderDirection.BUY
-                price = round_price(bid_p, pdec)
+                price = inside_quote_price(
+                    trade_dir, bid_p, ask_p, tick, pdec, self.inside_ticks
+                )
                 qty = self._round_qty(
-                    max(
-                        account.quote_balance.free * 0.25 / max(ask_p, 1e-9),
-                        self.min_quantity,
+                    min(
+                        account.quote_balance.free * 0.10 / max(ask_p, 1e-9),
+                        cap,
                     ),
                     vdec,
                 )
+            if price is None:
+                continue
             qty = free_qty(trade_dir, qty, price, account, self.min_quantity)
             if qty < self.min_quantity:
                 continue
-            if trade_dir == OrderDirection.BUY and price >= ask_p:
-                continue
-            if trade_dir == OrderDirection.SELL and price <= bid_p:
-                continue
-            response.limit_order(book_id, trade_dir, qty, price, postOnly=True)
-            budget.use(book_id)
+            if self._try_limit_order(
+                response,
+                book_id=book_id,
+                direction=trade_dir,
+                quantity=qty,
+                price=price,
+                postOnly=True,
+            ):
+                budget.use(book_id)
 
     def _place_inside_quotes(
         self,
@@ -314,7 +417,10 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
             if book_id % self.rotation_groups != self._bucket:
                 continue
             bh = self._book_health.setdefault(book_id, BookHealth())
-            if bh.blacklist_until > self._tick or book_id in self._completions:
+            if bh.blacklist_until > self._tick:
+                continue
+            pending = self._completions.get(book_id)
+            if pending is not None and pending.attempts < 6:
                 continue
 
             book = state.books.get(book_id)
@@ -329,11 +435,9 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
                 continue
 
             spread_ticks = spread / tick
-            if spread_ticks < self.min_spread_ticks:
+            if not self._spread_ticks_ok(spread_ticks):
                 continue
             if spread / mid > self.max_spread_ratio:
-                continue
-            if spread_ticks < (2 * self.inside_ticks + 1):
                 continue
             try:
                 if account.fees.maker_fee_rate >= self.max_maker_fee:
@@ -364,36 +468,28 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
 
             if signal > micro_cutoff:
                 trade_dir = OrderDirection.SELL
-                price = round_price(ask_p - self.inside_ticks * tick, pdec)
             elif signal < -micro_cutoff:
                 trade_dir = OrderDirection.BUY
-                price = round_price(bid_p + self.inside_ticks * tick, pdec)
             elif skew > self.inventory_soft:
                 trade_dir = OrderDirection.SELL
-                price = round_price(ask_p - self.inside_ticks * tick, pdec)
             elif skew < -self.inventory_soft:
                 trade_dir = OrderDirection.BUY
-                price = round_price(bid_p + self.inside_ticks * tick, pdec)
             else:
                 trade_dir = (
                     OrderDirection.SELL
                     if (book_id + self._tick) % 2 == 0
                     else OrderDirection.BUY
                 )
-                price = round_price(
-                    ask_p - self.inside_ticks * tick
-                    if trade_dir == OrderDirection.SELL
-                    else bid_p + self.inside_ticks * tick,
-                    pdec,
-                )
+
+            price = inside_quote_price(
+                trade_dir, bid_p, ask_p, tick, pdec, self.inside_ticks
+            )
+            if price is None:
+                continue
 
             qty = self._round_qty(self.base_quantity, vdec)
             qty = free_qty(trade_dir, qty, price, account, self.min_quantity)
             if qty < self.min_quantity:
-                continue
-            if trade_dir == OrderDirection.BUY and price >= ask_p:
-                continue
-            if trade_dir == OrderDirection.SELL and price <= bid_p:
                 continue
             try:
                 if price in {o.price for o in account.orders}:
@@ -401,16 +497,17 @@ class AdaptiveSteadyMaker(FinanceSimulationAgent):
             except Exception:
                 pass
 
-            response.limit_order(
-                book_id,
-                trade_dir,
-                qty,
-                price,
+            if self._try_limit_order(
+                response,
+                book_id=book_id,
+                direction=trade_dir,
+                quantity=qty,
+                price=price,
                 postOnly=True,
                 timeInForce=TimeInForce.GTC,
-            )
-            budget.use(book_id)
-            placed += 1
+            ):
+                budget.use(book_id)
+                placed += 1
 
 
 if __name__ == "__main__":

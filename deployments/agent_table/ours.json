@@ -43,10 +43,10 @@
     },
     {
       "agent_id": "48",
-      "label": "deploy-adaptive-steady-1.0",
+      "label": "deploy-adaptive-steady-1.2",
       "deployment": "adaptive-steady-1.0.0",
       "run_script": "run_deploy_adaptive_steady.sh",
-      "note": "AdaptiveSteadyMaker Option B — inside-spread + microprice; set EXPECTED_UID before deploy"
+      "note": "AdaptiveSteadyMaker 1.2.0 — persistent RT completions, kappa activity fix; UID 48"
     },
     {
       "agent_id": "pending",
