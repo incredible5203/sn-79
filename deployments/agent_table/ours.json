@@ -35,7 +35,7 @@
       "note": "AscendKappaFastAgent — Option C test UID; 24h pass: penalty=0, kappa>=0.504 rising, realized>0, min_rt>3k"
     },
     {
-      "agent_id": "18",
+      "agent_id": "pending",
       "label": "deploy-predictive-maker-1.0",
       "deployment": "predictive-maker-1.0.0",
       "run_script": "run_deploy_predictive_maker.sh",
@@ -49,7 +49,7 @@
       "note": "AdaptiveSteadyMaker 1.2.0 — persistent RT completions, kappa activity fix; UID 48"
     },
     {
-      "agent_id": "pending",
+      "agent_id": "18",
       "label": "deploy-microprice-momentum-1.0",
       "deployment": "microprice-momentum-1.0.0",
       "run_script": "run_deploy_microprice_momentum.sh",

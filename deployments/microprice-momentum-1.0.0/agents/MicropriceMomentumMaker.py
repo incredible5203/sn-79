@@ -63,6 +63,9 @@ class MicropriceMomentumMaker(FinanceSimulationAgent):
         self.min_rt_edge_ticks = float(
             getattr(self.config, "min_completion_rt_edge_ticks", 3.0)
         )
+        self.flatten_max_qty_mult = float(
+            getattr(self.config, "flatten_max_qty_mult", 2.0)
+        )
         self.completion_max_age_ns = int(
             getattr(self.config, "completion_max_age_ns", 12_000_000_000)
         )
@@ -263,6 +266,9 @@ class MicropriceMomentumMaker(FinanceSimulationAgent):
         for b in done:
             self._completions.pop(b, None)
 
+    def _flatten_cap_qty(self) -> float:
+        return self.base_quantity * self.flatten_max_qty_mult
+
     def _flatten_inventory(
         self,
         state: MarketSimulationStateUpdate,
@@ -271,6 +277,7 @@ class MicropriceMomentumMaker(FinanceSimulationAgent):
         pdec: int,
         vdec: int,
     ) -> None:
+        cap = self._flatten_cap_qty()
         for book_id, account in self.accounts.items():
             if not budget.ok(book_id):
                 continue
@@ -285,17 +292,21 @@ class MicropriceMomentumMaker(FinanceSimulationAgent):
 
             if skew > self.inventory_hard:
                 trade_dir = OrderDirection.SELL
-                price = round_price(ask_p, pdec)
+                price = round_price(ask_p - (ask_p - bid_p) * 0.25, pdec)
+                if price <= bid_p:
+                    price = round_price(bid_p + 10 ** (-pdec), pdec)
                 qty = self._round_qty(
-                    max(account.base_balance.free * 0.25, self.min_quantity), vdec
+                    min(account.base_balance.free * 0.10, cap), vdec
                 )
             else:
                 trade_dir = OrderDirection.BUY
-                price = round_price(bid_p, pdec)
+                price = round_price(bid_p + (ask_p - bid_p) * 0.25, pdec)
+                if price >= ask_p:
+                    price = round_price(ask_p - 10 ** (-pdec), pdec)
                 qty = self._round_qty(
-                    max(
-                        account.quote_balance.free * 0.25 / max(ask_p, 1e-9),
-                        self.min_quantity,
+                    min(
+                        account.quote_balance.free * 0.10 / max(ask_p, 1e-9),
+                        cap,
                     ),
                     vdec,
                 )
