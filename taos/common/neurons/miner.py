@@ -23,6 +23,7 @@ callbacks, and drives the async serving loop for subnet miners.
 """
 
 import os
+import sys
 import time
 import typing
 import asyncio
@@ -93,6 +94,7 @@ class BaseMinerNeuron(BaseNeuron):
         
         module_spec = importlib.util.spec_from_file_location(self.config.agent.name, os.path.join(self.config.agent.path, self.config.agent.name + '.py'))
         agent_module = importlib.util.module_from_spec(module_spec)
+        sys.modules[module_spec.name] = agent_module
         module_spec.loader.exec_module(agent_module)
         agent_class = getattr(agent_module, self.config.agent.name)
         self.agent = agent_class(self.uid, self.config.agent.params, self.config.neuron.full_path)
